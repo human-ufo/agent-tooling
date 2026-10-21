@@ -77,6 +77,14 @@ class PushHookTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("push directo a 'main' bloqueado", result.stderr)
 
+    def test_push_to_main_from_another_branch_is_blocked(self):
+        # El bug: el hook protegia la rama del HEAD, no la del ref empujado.
+        # Un "git push origin main" desde otra rama se escapaba.
+        self.git("checkout", "-q", "docs/una")
+        result = run_hook(self.clone, self.env, stdin=self.push_stdin("main"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("push directo a 'main' bloqueado", result.stderr)
+
     def test_push_to_main_allowed_with_explicit_bypass(self):
         self.git("checkout", "-q", "main")
         env = dict(self.env, ALLOW_MAIN_PUSH="1")

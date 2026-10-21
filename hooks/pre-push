@@ -38,15 +38,9 @@ if [[ "${AGENT_SKIP_PUSH_CHECKS:-0}" == "1" ]]; then
 fi
 
 # --- 1. main/master protegidos -----------------------------------------------
-if [[ "$branch" == "main" || "$branch" == "master" ]]; then
-  if [[ "${ALLOW_MAIN_PUSH:-0}" != "1" ]]; then
-    echo "pre-push: push directo a '${branch}' bloqueado." >&2
-    echo "  El trunk se mueve por pull request, no por push directo." >&2
-    echo "  Bypass explícito, solo si corresponde: ALLOW_MAIN_PUSH=1 git push ..." >&2
-    exit 1
-  fi
-  echo "pre-push: push a '${branch}' permitido por ALLOW_MAIN_PUSH=1." >&2
-fi
+# La proteccion se aplica al REF QUE SE EMPUJA, no a la rama del HEAD. Si se
+# protegiera solo el HEAD, un "git push origin main" desde otra rama pasaria.
+# Se chequea el ref de destino de cada push, que es donde el trunk se mueve.
 
 # --- 2. force sin lease ------------------------------------------------------
 push_flags=("${@:3}")
@@ -78,7 +72,15 @@ while read -r local_ref local_sha remote_ref remote_sha; do
 
   # Solo refs de rama. Las etiquetas y las refs de pull request no compiten por
   # la rama del trunk.
-  if [[ "$target_branch" == "main" || "$target_branch" == "master" ]]; then
+  if [[ "$target_branch" != "main" && "$target_branch" != "master" ]]; then
+    : # rama cualquiera: sigue el chequeo de lock y el registro
+  elif [[ "${ALLOW_MAIN_PUSH:-0}" == "1" ]]; then
+    echo "pre-push: push a '${target_branch}' permitido por ALLOW_MAIN_PUSH=1." >&2
+  else
+    echo "pre-push: push directo a '${target_branch}' bloqueado." >&2
+    echo "  El trunk se mueve por pull request, no por push directo." >&2
+    echo "  Bypass explicito, solo si corresponde: ALLOW_MAIN_PUSH=1 git push ..." >&2
+    blocked=1
     continue
   fi
 

@@ -34,7 +34,7 @@ install_hook() {
 
 for repo in "$@"; do
   [[ -d "${repo}" ]] || { echo "no existe: ${repo}" >&2; continue; }
-  install_hook "${repo}" pre-push "${here}/pre-push"
+  install_hook "${repo}" pre-push "${here}/hooks/pre-push"
   # El lint de documentacion vive con la skill que lo define.
   lint_hook="${HOME}/.agents/skills/docs-writer/pre-commit"
   if [[ -f "${lint_hook}" ]]; then
