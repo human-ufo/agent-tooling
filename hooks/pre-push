@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# -----------------------------------------------------------------------------
+# Hook pre-push — la barrera de escritura, local y agnóstica de marca.
+#
+# GitHub no expone branch protection en repos privados del plan gratis, y aun
+# con Pro la barrera vive en el remoto: protege el push, no el working tree.
+# Este hook cubre las dos cosas que nos hicieron falta el 2026-10-21:
+#
+# 1. Ningún push directo a main/master. Bypass explícito: ALLOW_MAIN_PUSH=1.
+# 2. Nada de --force pelado. Solo --force-with-lease, que es un
+#    compare-and-swap sobre la ref: si alguien movió la rama entremedio, el
+#    push falla en vez de pisar su trabajo. Sin --force-with-lease se bloquea.
+# 3. Si otra sesión viva tiene tomado ESA rama, el push se bloquea y se dice
+#    quién la tiene. El lock es de otra rama, no bloquea.
+# 4. Log de cambios con actor: quién empujó qué rama, de qué sha a qué sha,
+#    desde qué worktree. Queda en ~/.cache/agent-changesets/<repo>.jsonl.
+# 5. Verificación que corre sobre el árbol EXACTO que va a aterrizar, no sobre
+#    el working tree. Si el repo define AGENT_PUSH_VERIFY, se ejecuta con el
+#    commit a empujar como argumento, en el commit.
+#
+# Es un hook local: viaja con la máquina, no con la marca del agente.
+#
+# Instalar con: install-hooks.sh <repo> [<repo> ...]
+# Bypasses: ALLOW_MAIN_PUSH=1, AGENT_SKIP_PUSH_CHECKS=1
+# -----------------------------------------------------------------------------
+set -Eeuo pipefail
+
+remote_name="$1"
+remote_url="$2"
+
+branch="$(git symbolic-ref --short HEAD 2>/dev/null || true)"
+repo_root="$(git rev-parse --show-toplevel)"
+repo_name="$(basename "$repo_root")"
+
+if [[ "${AGENT_SKIP_PUSH_CHECKS:-0}" == "1" ]]; then
+  echo "pre-push: verificaciones omitidas por AGENT_SKIP_PUSH_CHECKS=1." >&2
+  exit 0
+fi
+
+# --- 1. main/master protegidos -----------------------------------------------
+if [[ "$branch" == "main" || "$branch" == "master" ]]; then
+  if [[ "${ALLOW_MAIN_PUSH:-0}" != "1" ]]; then
+    echo "pre-push: push directo a '${branch}' bloqueado." >&2
+    echo "  El trunk se mueve por pull request, no por push directo." >&2
+    echo "  Bypass explícito, solo si corresponde: ALLOW_MAIN_PUSH=1 git push ..." >&2
+    exit 1
+  fi
+  echo "pre-push: push a '${branch}' permitido por ALLOW_MAIN_PUSH=1." >&2
+fi
+
+# --- 2. force sin lease ------------------------------------------------------
+push_flags=("${@:3}")
+if printf '%s\n' "${push_flags[@]:-}" | grep -qx -- '--force' || printf '%s\n' "${push_flags[@]:-}" | grep -qx -- '-f'; then
+  if ! printf '%s\n' "${push_flags[@]:-}" | grep -q -- '--force-with-lease'; then
+    echo "pre-push: --force sin --force-with-lease bloqueado." >&2
+    echo "  --force pisa lo que otra sesión empujó. Usá --force-with-lease=<ref>:<sha>," >&2
+    echo "  que es un compare-and-swap: falla si la rama se movió." >&2
+    exit 1
+  fi
+fi
+
+# --- 3. y 4. lock por rama y log de cambios ----------------------------------
+# Los refs a empujar llegan por stdin: "<local ref> <local sha> <remote ref> <remote sha>".
+zero='0000000000000000000000000000000000000000'
+actor="${AGENT_ACTOR:-${AGENT_NAME:-$(whoami)}}"
+session="${AGENT_SESSION:-$$}"
+worktree="$repo_root"
+changeset_dir="${AGENT_CHANGESET_DIR:-${HOME}/.cache/agent-changesets}"
+changeset_log="${changeset_dir}/${repo_name}.jsonl"
+lock_bin="${AGENT_LOCK_BIN:-}"
+[[ -z "$lock_bin" ]] && lock_bin="$(command -v agent-lock || true)"
+
+blocked=0
+pending=""
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [[ -z "${local_ref:-}" ]] && continue
+  target_branch="${remote_ref#refs/heads/}"
+
+  # Solo refs de rama. Las etiquetas y las refs de pull request no compiten por
+  # la rama del trunk.
+  if [[ "$target_branch" == "main" || "$target_branch" == "master" ]]; then
+    continue
+  fi
+
+  if [[ -n "$lock_bin" && -x "$lock_bin" ]]; then
+    lock_out="$("$lock_bin" check "$repo_root" --branch "$target_branch" 2>&1)" || true
+    if printf '%s' "$lock_out" | grep -q 'TOMADO'; then
+      if ! printf '%s' "$lock_out" | grep -q 'Sin conflicto real'; then
+        echo "pre-push: la rama '${target_branch}' está tomada por otra sesión:" >&2
+        printf '%s\n' "$lock_out" | sed 's/^/  /' >&2
+        echo "  Coordiná con esa sesión antes de empujar." >&2
+        blocked=1
+      fi
+    fi
+  fi
+
+  # El registro se acumula en memoria: un push bloqueado no debe dejar
+  # rastro en el log de cambios, porque no hubo cambio.
+  pending+=$(jq -nc \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg actor "$actor" \
+    --arg session "$session" \
+    --arg repo "$repo_name" \
+    --arg branch "$target_branch" \
+    --arg local_ref "$local_ref" \
+    --arg local_sha "$local_sha" \
+    --arg remote_ref "$remote_ref" \
+    --arg remote_sha "$remote_sha" \
+    --arg worktree "$worktree" \
+    --arg remote "$remote_name" \
+    '{ts:$ts, actor:$actor, session:$session, repo:$repo, branch:$branch,
+      local_ref:$local_ref, local_sha:$local_sha, remote_ref:$remote_ref,
+      remote_sha_before:$remote_sha, worktree:$worktree, remote:$remote}')
+  pending+=$'\n'
+done
+
+if [[ "$blocked" == "1" ]]; then
+  echo "" >&2
+  echo "pre-push: no se empuja nada. Revisá el lock de la rama." >&2
+  exit 1
+fi
+
+if [[ -n "${pending:-}" ]]; then
+  mkdir -p "$changeset_dir"
+  printf '%s' "$pending" >> "$changeset_log"
+fi
+
+# --- 5. verificación sobre el árbol exacto que aterriza ----------------------
+if [[ -n "${AGENT_PUSH_VERIFY:-}" ]]; then
+  head_sha="$(git rev-parse HEAD)"
+  if ! git cat-file -e "${head_sha}^{commit}" 2>/dev/null; then
+    echo "pre-push: no puedo resolver HEAD para verificar." >&2
+    exit 1
+  fi
+  echo "pre-push: verificando '${AGENT_PUSH_VERIFY}' sobre ${head_sha}..." >&2
+  if ! "${AGENT_PUSH_VERIFY}" "$head_sha"; then
+    echo "pre-push: la verificación falló sobre el commit a empujar. No se empuja." >&2
+    exit 1
+  fi
+fi
+
+exit 0
