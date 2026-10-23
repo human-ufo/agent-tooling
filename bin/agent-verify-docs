@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Verificador de publicación para repos de gobernanza documental.
+#
+# Uso: agent-verify-docs [--profile docs|tasks] [--lint RUTA] <sha-anunciado>
+#
+# El hook `agent.pushVerify` lo invoca en un checkout descartable del commit
+# anunciado y le pasa ese commit como último argumento. La ruta de este script
+# debe ser ABSOLUTA en la configuración del repositorio: el verificador corre
+# con el directorio de trabajo en ese checkout, donde una ruta relativa no
+# existe.
+#
+# El linter de documentación vive fuera del repositorio verificado, en
+# ~/.agents/skills/docs-writer/lint_docs.py, y se puede sobreescribir con
+# DOCS_LINT o con --lint. Para `agent-tasks` el perfil `tasks` usa el linter
+# del propio repositorio (scripts/lint_tasks.py).
+set -Eeuo pipefail
+source_path="$(readlink -f "${BASH_SOURCE[0]}")"
+exec python3 "$(dirname "$source_path")/../lib/agent_verify_docs.py" "$@"

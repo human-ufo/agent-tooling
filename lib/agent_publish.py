@@ -522,6 +522,29 @@ def dispatcher(commands):
             "    if result.returncode: sys.exit(result.returncode)\n")
 
 
+# Repositories whose documents follow the documentation standard. The lint of
+# the docs-writer skill is only meaningful there.
+DOCUMENTATION_REPOSITORIES = ("personal-docs", "avla-docs-reporteria")
+
+
+def documentation_repository(repo):
+    """True when the repository is one of the governance documentation repos.
+
+    The directory name decides, and so does the origin remote: a clone of a
+    documentation repository can sit in any directory.
+    """
+    candidates = [Path(repo).resolve().name]
+    try:
+        url = git("config", "--get", "remote.origin.url", cwd=repo, check=False).stdout.strip()
+        if url:
+            candidates.append(url.rstrip("/").rsplit("/", 1)[-1])
+            if url.endswith(".git"):
+                candidates.append(url.rstrip("/")[:-4].rsplit("/", 1)[-1])
+    except (OSError, Rejected):
+        pass
+    return any(candidate in DOCUMENTATION_REPOSITORIES for candidate in candidates)
+
+
 def install_one(repo, hooks):
     manifest_path = hooks / "agent-tooling-manifest.json"
     original_manifest = manifest_path.read_bytes() if manifest_path.exists() else None
@@ -545,12 +568,16 @@ def install_one(repo, hooks):
     payload = {}
     for relative in ("hooks/pre-push", "bin/agent-lock", "bin/agent-worktree", "lib/agent_publish.py", "lib/agent_lifecycle.py"):
         payload[relative] = (ROOT / relative).read_bytes()
-    lint = Path.home() / ".agents/skills/docs-writer/pre-commit"
-    if lint.is_file():
-        payload["hooks/pre-commit-docs-lint"] = lint.read_bytes()
-    elif "pre-commit" in manifest["hooks"]:
-        # Keep previously installed lint when source skill isn't available.
-        payload["hooks/pre-commit-docs-lint"] = Path(manifest["hooks"]["pre-commit"]["source"]).read_bytes()
+    # The documentation lint only applies to the governance repositories. Its
+    # rules demand sections that a task file or a source file does not have, so
+    # installing it anywhere else blocks legitimate commits.
+    if documentation_repository(repo):
+        lint = Path.home() / ".agents/skills/docs-writer/pre-commit"
+        if lint.is_file():
+            payload["hooks/pre-commit-docs-lint"] = lint.read_bytes()
+        elif "pre-commit" in manifest["hooks"]:
+            # Keep previously installed lint when source skill isn't available.
+            payload["hooks/pre-commit-docs-lint"] = Path(manifest["hooks"]["pre-commit"]["source"]).read_bytes()
     names = ["pre-push"] + (["pre-commit"] if "hooks/pre-commit-docs-lint" in payload else [])
     for name in names:
         target = hooks / name

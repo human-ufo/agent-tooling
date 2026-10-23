@@ -20,6 +20,10 @@ git -C /ruta/al/repo config agent.pushVerifyMode optional
 # descartable, donde una ruta relativa no existe.
 git -C /ruta/al/agent-tooling config agent.pushVerifyMode required
 git -C /ruta/al/agent-tooling config agent.pushVerify /ruta/al/agent-tooling/bin/agent-verify-selftest
+# En un repositorio de gobernanza documental, el verificador es el helper de
+# documentación. También con ruta ABSOLUTA.
+git -C /ruta/al/personal-docs config agent.pushVerifyMode required
+git -C /ruta/al/personal-docs config agent.pushVerify /ruta/al/agent-tooling/bin/agent-verify-docs
 
 # Sesión: la base se obtiene del default branch remoto, nunca de HEAD sucio.
 agent-worktree open /ruta/al/repo --agent codex --session tarea-123 --branch agent/tarea-123
@@ -77,10 +81,116 @@ ese SHA. `optional` permite que no haya comando; cualquier comando configurado
 que falle bloquea **todo** el push, igual que `required`. `required` sin comando
 también bloquea. No se usa la antigua variable `AGENT_PUSH_VERIFY`. El timeout
 predeterminado es de 300 segundos por ref, configurable con
-`agent.pushVerifyTimeout` (1–86400).
+`agent.pushVerifyTimeout` (1–86400). Para los repos de gobernanza documental
+hay un verificador listo, `bin/agent-verify-docs`, descrito más abajo.
 
 La ruta del verificador debe ser absoluta: corre con el directorio de trabajo
 en el checkout descartable, donde una ruta relativa no existe.
+
+## Verificador de documentación: `bin/agent-verify-docs`
+
+`agent-verify-docs` es el verificador para los repos de gobernanza documental
+(`personal-docs`, `avla-docs-reporteria`) y para `agent-tasks`. Recibe el SHA
+anunciado como argumento final, en el mismo contrato que cualquier otro
+verificador de `agent.pushVerify`.
+
+Qué hace, en este orden:
+
+1. Resuelve el objeto anunciado y comprueba que el `HEAD` del checkout
+   corresponde a ese commit. Si no, falla: el verificador juzga una cosa
+   distinta de la que se publica.
+2. Lista los `.md` **agregados y modificados en ese commit**, con
+   `git diff-tree --no-commit-id --name-only -r --diff-filter=AM <sha>`.
+3. Corre el linter de documentación sobre esos archivos con la **misma regla
+   de severidad que el `pre-commit`**: un documento **nuevo** tiene que pasar
+   todas las reglas; un documento **previo modificado** solo bloquea por
+   errores críticos (mojibake, posible secreto, links `file://`) y el resto se
+   informa como aviso.
+4. Si el commit no agrega ni modifica ningún `.md`, sale con 0: un commit de
+   código no tiene por qué fallar.
+
+Por qué no usa `origin/main`: en el checkout descartable el `origin` es el
+**worktree local**, no GitHub. Ahí `origin/main` no existe cuando el
+repositorio de origen no tiene una rama local `main`, y cuando existe
+describe otra cosa: no el commit anunciado sino el estado de la rama. El
+linter en modo `--changed` (`git diff origin/main...HEAD`) falla en ese
+checkout o revisa el árbol equivocado. El helper saca el conjunto de archivos
+del **propio commit**, así que juzga exactamente lo que se publica, sin
+depender de ninguna referencia remota.
+
+Configuración:
+
+| Qué | Dónde | Valor por defecto |
+| --- | --- | --- |
+| Ruta del verificador | `agent.pushVerify` | ninguna: hay que declararla, y **absoluta** |
+| Modo | `agent.pushVerifyMode` | ninguna: hay que declararlo (`optional` o `required`) |
+| Ruta del linter de documentación | `DOCS_LINT` | `~/.agents/skills/docs-writer/lint_docs.py` |
+| Perfil del linter | `--profile` o `DOCS_LINT_PROFILE` | `docs` |
+| Linter de tareas | `--profile tasks` | `<repo>/scripts/lint_tasks.py` (dentro del repositorio) |
+
+El valor por defecto del linter es `~/.agents/skills/docs-writer/lint_docs.py`:
+es el mismo archivo que usa el `pre-commit` de los repos de documentación, así
+que el hook y el verificador aplican las mismas reglas. El linter **no** se
+modifica ni se copia a este repositorio: vive fuera, en el filesystem del
+usuario, y el helper lo carga por ruta absoluta. Si no está, el verificador
+falla con un mensaje accionable (no se encontró el linter en …; instalá el
+skill docs-writer o configurá la ruta), nunca con una excepción sin contexto.
+
+`DOCS_LINT` y `DOCS_LINT_PROFILE` no llegan al verificador por sí solas: el
+hook filtra el entorno y solo deja pasar las variables declaradas en
+`agent.pushVerifyEnv`. Para usarlas hay que declararlas:
+
+```bash
+git -C /ruta/al/repo config agent.pushVerifyEnv "DOCS_LINT DOCS_LINT_PROFILE"
+```
+
+Los prefijos `AGENT_` y `GIT_` están rechazados en ese allowlist, así que las
+variables de este helper no los usan.
+
+Declarar `required` en un repositorio documental:
+
+```bash
+# personal-docs
+git -C /home/human/Documents/personal-docs config agent.pushVerifyMode required
+git -C /home/human/Documents/personal-docs config agent.pushVerify \
+  /home/human/Documents/agent-tooling/bin/agent-verify-docs
+
+# avla-docs-reporteria
+git -C /home/human/Documents/avla-docs-reporteria config agent.pushVerifyMode required
+git -C /home/human/Documents/avla-docs-reporteria config agent.pushVerify \
+  /home/human/Documents/agent-tooling/bin/agent-verify-docs
+
+# agent-tasks, cuyo linter vive dentro del propio repositorio
+git -C /home/human/Documents/agent-tasks config agent.pushVerifyMode required
+git -C /home/human/Documents/agent-tasks config agent.pushVerify \
+  "/home/human/Documents/agent-tooling/bin/agent-verify-docs --profile tasks"
+```
+
+La ruta puede ser la del repositorio de tooling o un enlace en
+`~/.local/bin`, que es donde ya viven `agent-push`, `agent-lock` y
+`agent-worktree`:
+
+```bash
+ln -sfn /home/human/Documents/agent-tooling/bin/agent-verify-docs ~/.local/bin/agent-verify-docs
+git -C /home/human/Documents/personal-docs config agent.pushVerify \
+  /home/human/.local/bin/agent-verify-docs
+```
+
+El enlace tiene que ser un **enlace simbólico**, no una copia: el wrapper
+resuelve su propia ruta con `readlink -f` para encontrar `lib/agent_verify_docs.py`
+que tiene al lado. Un archivo copiado a otro lugar no encuentra la librería y
+falla.
+
+El perfil `tasks` cubre el linter de `agent-tasks`, que no distingue errores
+críticos de los demás: ahí cualquier error bloquea, en documentos nuevos y en
+documentos previos modificados, que es la misma regla que su `pre-commit`.
+
+**Limitación fundamental:** el verificador ve el **commit anunciado**, no el
+árbol de trabajo. No puede juzgar si un cambio sin commitear está bien, ni
+detectar un archivo roto que todavía no está en ningún commit. Solo publica
+correctamente lo que ya está commiteado. Además, el helper no modifica el
+linter: si las reglas cambian, hay que actualizar el skill docs-writer y
+reinstalarlo, no el repositorio de tooling.
 
 Un tag anotado anuncia el **objeto tag**, no el commit. El checkout se hace del
 commit peeled, así que `HEAD` no coincide con el SHA anunciado; el verificador
