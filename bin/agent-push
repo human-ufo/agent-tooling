@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Explicit, exact-lease publication. See agent-push --help.
+set -Eeuo pipefail
+source_path="$(readlink -f "${BASH_SOURCE[0]}")"
+exec python3 "$(dirname "$source_path")/../lib/agent_publish.py" push "$@"

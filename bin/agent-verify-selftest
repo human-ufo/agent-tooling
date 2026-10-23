@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# agent.pushVerify helper: Git calls this in a disposable checkout with its SHA.
+set -Eeuo pipefail
+[[ $# -eq 1 ]] || { echo 'expected commit SHA' >&2; exit 2; }
+# An annotated tag announces the tag object, not the commit. The checkout holds
+# the peeled commit, so compare against the resolved commit and also require
+# that the announced object exists in this checkout.
+announced="$1"
+resolved="$(git rev-parse --verify "${announced}^{commit}" 2>/dev/null || true)"
+[[ -n "$resolved" ]] || { echo "announced object is not a commit in this checkout: ${announced}" >&2; exit 1; }
+[[ "$(git rev-parse HEAD)" == "$resolved" ]] || { echo 'verification checkout differs from pushed commit' >&2; exit 1; }
+if [[ "${AGENT_VERIFY_OBJECT_TYPE:-commit}" == "tag" ]]; then
+  git cat-file -e "${announced}^{tag}" 2>/dev/null || { echo "announced tag object is missing: ${announced}" >&2; exit 1; }
+fi
+exec python3 -m unittest discover -s tests -v
