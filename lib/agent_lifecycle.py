@@ -324,6 +324,10 @@ def worktree_command(args):
                           'action': 'migrate explicitly; missing records/data are never deleted by reconcile'})
             return 0
         if args.command == 'migrate':
+            # Migration rewrites how sessions are tracked, so it needs a reason
+            # in the audit trail, like the lock migration does.
+            if not (args.reason or '').strip():
+                raise Failure('migration requires --reason for the audit trail')
             file, records = registry(root, repo, allow_legacy=True)
             old = legacy_files(root, repo, '.json')
             actual = {r['worktree']: r for r in registered_worktrees(repo)}
@@ -349,6 +353,7 @@ def worktree_command(args):
             save_registry(file, repo, records)
             for source, _ in old:
                 source.rename(source.with_suffix('.json.migrated'))
+            audit(root, 'worktree-migrate', args, repo, {'migrated': len(old), 'sessions': len(records)})
             report(args, {'message': f'migrated {len(old)} legacy registries', 'repo_id': repo['repo_id']})
             return 0
         file, records = registry(root, repo)
@@ -384,6 +389,7 @@ def worktree_command(args):
                 save_registry(file, repo, records + [rec])
             except Exception as exc:
                 raise Failure(f'worktree created at {path}, branch {args.branch}, but registry write failed; preserve it and reconcile: {exc}') from exc
+            audit(root, 'worktree-open', args, repo, {'branch': args.branch, 'branch_oid': oid, 'worktree': str(path), 'base': base})
             report(args, dict(rec, actor=rec['agent'], worktree=rec['path'], message=f'session {args.session} open\n  rama: {args.branch}\n  ruta: {path}\n  base: {base}'))
             return 0
         rec = find_session(records, args, repo)
@@ -442,6 +448,11 @@ def worktree_command(args):
             # Compare-and-delete prevents racing an unrelated branch update.
             git(repo['repo'], 'update-ref', '-d', branch_ref, branch_oid)
         save_registry(file, repo, [r for r in records if r['session'] != rec['session']])
+        # Closing a session and deleting a branch are the destructive steps, so
+        # they leave an audit trail. A retained branch is also recorded, because
+        # the record of the session ends here.
+        audit(root, 'worktree-close', args, repo, {'branch': rec['branch'], 'branch_oid': branch_oid,
+                                                   'branch_pruned': bool(args.prune), 'worktree': str(path)})
         report(args, {'message': f'session {rec["session"]} closed; branch {rec["branch"]} ' + ('pruned' if args.prune else 'retained'), 'branch': rec['branch'], 'branch_retained': not args.prune, 'repo_id': repo['repo_id']})
         return 0
 

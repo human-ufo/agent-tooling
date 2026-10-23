@@ -15,9 +15,11 @@ no autentican al usuario frente al remoto.
 
 # La decisión de verificar contenido debe quedar explícita por repositorio.
 git -C /ruta/al/repo config agent.pushVerifyMode optional
-# Para este repositorio, exigir la suite del commit enviado:
+# Para este repositorio, exigir la suite del commit enviado. La ruta del
+# verificador debe ser ABSOLUTA: el verificador corre en un checkout temporal
+# descartable, donde una ruta relativa no existe.
 git -C /ruta/al/agent-tooling config agent.pushVerifyMode required
-git -C /ruta/al/agent-tooling config agent.pushVerify ./bin/agent-verify-selftest
+git -C /ruta/al/agent-tooling config agent.pushVerify /ruta/al/agent-tooling/bin/agent-verify-selftest
 
 # Sesión: la base se obtiene del default branch remoto, nunca de HEAD sucio.
 agent-worktree open /ruta/al/repo --agent codex --session tarea-123 --branch agent/tarea-123
@@ -47,27 +49,44 @@ Una carrera remota invalida el lease, aunque el remote-tracking local esté viej
 
 El hook recibe de Git solamente nombre/URL del remoto y las actualizaciones
 por stdin. Comprueba cada SHA enviado, no HEAD ni el árbol de trabajo actual.
-Reescrituras, reemplazo de tags, borrados y cambios directos a main/master
+Reescrituras, reemplazo de tags, borrados y cambios directos al trunk
 requieren la autorización de un solo uso del wrapper, ligada a repositorio,
 remoto, conjunto exacto de refs/SHA, actor y sesión. Caduca en cinco minutos y
-se consume incluso si la operación se rechaza. `ALLOW_MAIN_PUSH` no autoriza
-trunk; `AGENT_SKIP_PUSH_CHECKS` se rechaza. Los merges de PR hechos por GitHub
-siguen su flujo normal, fuera del hook local.
+se consume incluso si la operación se rechaza. El trunk es `main`, `master` y
+la rama por defecto que el remoto anuncia, sea cual sea su nombre.
+`ALLOW_MAIN_PUSH` no autoriza trunk; `AGENT_SKIP_PUSH_CHECKS` se rechaza. Los
+merges de PR hechos por GitHub siguen su flujo normal, fuera del hook local.
 
 Para compatibilidad, `git push` identificado permite crear refs y avances
 fast-forward que pasan los controles. Ese camino no aporta atomicidad ni
 confirmación del resultado remoto. El flujo de agentes usa `agent-push`.
-Un hook local puede desactivarse desde Git: esta coordinación presupone
-clientes cooperativos y no sustituye controles del servidor.
+
+Bypasses conocidos, todos deliberados y visibles: `git push --no-verify` evita
+que Git ejecute el hook, y el hook local no puede impedirlo. Es el mismo límite
+que `git update-ref` directo sobre una ref: el hook protege el push, no el
+repositorio. Esta coordinación presupone clientes cooperativos y no sustituye
+controles del servidor. Lo que sí hace `agent-push` es detectar que el hook no
+consumió la autorización de la operación, y en ese caso reporta fallo aunque
+Git haya publicado: por eso el flujo de agentes no usa `git push` directo.
 
 El verificador se configura con `agent.pushVerify`: es una cadena de argumentos
-interpretada con `shlex`, sin shell; recibe el SHA como argumento final y
-`AGENT_VERIFY_SHA`/`AGENT_VERIFY_REF` en su entorno. Corre una vez por ref no
-borrada en un checkout descartable limpio de ese SHA. `optional` permite que
-no haya comando; cualquier comando configurado que falle bloquea **todo** el
-push, igual que `required`. `required` sin comando también bloquea. No se usa
-la antigua variable `AGENT_PUSH_VERIFY`. El timeout predeterminado es de 300
-segundos por ref, configurable con `agent.pushVerifyTimeout` (1–86400).
+interpretada con `shlex`, sin shell; recibe el SHA anunciado como argumento
+final y `AGENT_VERIFY_SHA`/`AGENT_VERIFY_REF`/`AGENT_VERIFY_OBJECT_TYPE` en su
+entorno. Corre una vez por ref no borrada en un checkout descartable limpio de
+ese SHA. `optional` permite que no haya comando; cualquier comando configurado
+que falle bloquea **todo** el push, igual que `required`. `required` sin comando
+también bloquea. No se usa la antigua variable `AGENT_PUSH_VERIFY`. El timeout
+predeterminado es de 300 segundos por ref, configurable con
+`agent.pushVerifyTimeout` (1–86400).
+
+La ruta del verificador debe ser absoluta: corre con el directorio de trabajo
+en el checkout descartable, donde una ruta relativa no existe.
+
+Un tag anotado anuncia el **objeto tag**, no el commit. El checkout se hace del
+commit peeled, así que `HEAD` no coincide con el SHA anunciado; el verificador
+recibe el objeto tag y `AGENT_VERIFY_OBJECT_TYPE=tag`, y el objeto tag queda
+en el store del checkout para validaciones como `git verify-tag`. Un verificador
+que compare contra `HEAD` debe resolver el tag antes.
 
 El entorno del verificador conserva PATH, HOME, USER, LOGNAME, TMPDIR, LANG,
 LC_* y SYSTEMROOT; excluye tokens de proveedores y la autorización del push.
@@ -100,6 +119,18 @@ sesión y operación. Registran intentos, rechazos, verificaciones y excepciones
 `confirmed` de `indeterminate`; el wrapper usa el resultado porcelain para
 confirmar aceptación/rechazo. Un push crudo queda `indeterminate`, pues el
 hook no ve su resultado. No se debe contar intentos como publicaciones.
+
+La apertura y el cierre de sesiones, y el borrado de una rama, se auditan aparte
+en `~/.cache/agent-worktrees/<repo_id>.audit.jsonl` (o `AGENT_WORKTREE_DIR`),
+con actor, sesión, rama, commit y motivo. Un cierre con rama conservada también
+queda registrado: el registro de la sesión termina ahí. Las migraciones del
+estado legado exigen `--reason` y quedan en el mismo archivo.
+
+Variables de entorno que aíslan el estado: `AGENT_LOCK_DIR` (locks),
+`AGENT_WORKTREE_DIR` (registro de sesiones) y `AGENT_CHANGESET_DIR` (eventos de
+publicación). Sin ellas, el estado vive bajo `~/.cache/`. Dos sesiones que
+compartan el mismo `HOME` comparten esos archivos por diseño; las que necesiten
+aislar el estado deben fijar las tres variables.
 
 El instalador respeta `core.hooksPath`, también relativo a un linked worktree.
 Encadena hooks ejecutables anteriores con el mismo stdin y conserva el lint

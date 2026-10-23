@@ -30,6 +30,27 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# Branches that are always treated as trunk, in addition to whatever the
+# remote advertises as its default branch.
+TRUNK_REFS = ("refs/heads/main", "refs/heads/master")
+
+
+def default_branch_ref(url):
+    """Resolve the default branch of a remote as a full ref, or None.
+
+    The remote's HEAD is the authority. A remote without an advertised HEAD
+    keeps the explicit list only, so an unknown remote never silently widens
+    or narrows the trunk protection.
+    """
+    head = git("ls-remote", "--symref", url, "HEAD", check=False)
+    if head.returncode:
+        return None
+    for line in head.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == "ref:" and parts[1].startswith("refs/heads/"):
+            return parts[1]
+    return None
+
 
 class Rejected(Exception):
     pass
@@ -196,11 +217,30 @@ def consume_authorization(common, repo_id, remote, url, actor, session, updates)
     if not isinstance(token, dict):
         raise Rejected("malformed publication authorization")
     issued, expires = token.get("issued_at"), token.get("expires_at")
+    # The window is five minutes. The tolerance absorbs the floating point
+    # drift of a window that is exactly the limit, which must not be read as
+    # an invalid lifetime.
     if (any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in (issued, expires))
-            or issued > time.time() + 30 or issued >= expires or expires - issued > 300 or expires <= time.time()):
+            or issued > time.time() + 30 or issued >= expires or expires - issued > 301 or expires <= time.time()):
         raise Rejected("expired or invalid publication authorization lifetime")
     expected = dict(repo_id=repo_id, remote=remote, url=url, actor=actor, session=session,
                     updates=sorted(updates, key=lambda u: u["ref"]))
+    if token.get("repo_id") != repo_id or token.get("remote") != remote or token.get("url") != url \
+            or token.get("actor") != actor or token.get("session") != session:
+        raise Rejected("publication authorization does not match actual push")
+    # The announced "old" has to be the one the wrapper observed against the
+    # live remote. A ref that moved in between is reported on its own, so the
+    # cause of the refusal is visible instead of a generic mismatch.
+    authorized_updates = token.get("updates")
+    if not isinstance(authorized_updates, list):
+        raise Rejected("malformed publication authorization")
+    announced = {u["ref"]: u for u in updates if isinstance(u, dict) and "ref" in u}
+    for row in authorized_updates:
+        if not isinstance(row, dict) or "ref" not in row:
+            raise Rejected("malformed publication authorization")
+        seen = announced.get(row["ref"])
+        if seen is not None and seen["old"] != row.get("old"):
+            raise Rejected("remote ref moved since the publication was authorized: " + row["ref"])
     if any(token.get(k) != v for k, v in expected.items()):
         raise Rejected("publication authorization does not match actual push")
     if not isinstance(token.get("operation_id"), str) or not token["operation_id"]:
@@ -222,7 +262,17 @@ def verify(worktree, update, trace, mode, command):
         with tempfile.TemporaryDirectory(prefix="agent-push-verify-") as temp:
             checkout = Path(temp) / "checkout"
             git("clone", "--quiet", "--shared", "--no-checkout", "--local", str(worktree), str(checkout))
-            git("-c", "core.hooksPath=/dev/null", "checkout", "--quiet", "--detach", update["new"], cwd=checkout)
+            # An annotated tag names a tag object, not a commit. Checking out
+            # the tag object resolves to its commit, so the checkout would show
+            # a different SHA than the one announced. The announced object is
+            # what the verifier has to judge, so it is passed unchanged and the
+            # tag object stays in the store for verify-tag style checks.
+            target = update["new"]
+            kind = git("cat-file", "-t", target, cwd=checkout, check=False).stdout.strip()
+            if kind == "tag":
+                git("-c", "core.hooksPath=/dev/null", "checkout", "--quiet", "--detach", target + "^{commit}", cwd=checkout)
+            else:
+                git("-c", "core.hooksPath=/dev/null", "checkout", "--quiet", "--detach", target, cwd=checkout)
             # This is a trusted command, not a security sandbox: same UID can
             # still read the filesystem. Ambient provider tokens are not passed.
             allowed = {"PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "LANG", "SYSTEMROOT"}
@@ -234,6 +284,7 @@ def verify(worktree, update, trace, mode, command):
             allowed.update(additions)
             env = {key: value for key, value in os.environ.items() if key in allowed or key.startswith("LC_")}
             env.update(AGENT_VERIFY_REF=update["ref"], AGENT_VERIFY_SHA=update["new"],
+                       AGENT_VERIFY_OBJECT_TYPE=kind or "unknown",
                        GIT_TERMINAL_PROMPT="0")
             timeout_text = config("agent.pushVerifyTimeout") or "300"
             try:
@@ -243,6 +294,10 @@ def verify(worktree, update, trace, mode, command):
             except ValueError as e:
                 raise Rejected("agent.pushVerifyTimeout must be 1..86400 seconds") from e
             p = subprocess.Popen([*argv, update["new"]], cwd=checkout, env=env, start_new_session=True)
+            # The verifier receives the announced object. For an annotated tag
+            # that is the tag object, so a verifier that compares against HEAD
+            # must resolve the tag itself. The checkout is the peeled commit;
+            # AGENT_VERIFY_OBJECT_TYPE says which of the two it is.
             try:
                 p.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
@@ -284,10 +339,19 @@ def hook(args):
             raise Rejected("configure agent.pushVerifyMode explicitly as optional or required")
         if mode == "required" and not command:
             raise Rejected("required verifier is not configured")
+        # Git reports the remote-tracking value it had, which may be stale.
+        # The authorization carries the value the wrapper observed against the
+        # live remote, so the hook decides on the same "old" the lease uses.
+        expected_old = {}
+        if authorized:
+            expected_old = {u["ref"]: u["old"] for u in authorized.get("updates", [])}
+        trunk = default_branch_ref(url)
         for update in updates:
             ref, old, new = update["ref"], update["old"], update["new"]
+            if ref in expected_old and expected_old[ref] != old:
+                raise Rejected("remote ref moved since the publication was authorized: " + ref)
             check_lock(worktree, ref, actor, session)
-            if ref in ("refs/heads/main", "refs/heads/master"):
+            if ref in TRUNK_REFS or ref == trunk:
                 if not authorized or not authorized.get("allow_trunk") or not authorized.get("reason", "").strip():
                     raise Rejected("direct trunk push requires agent-push --allow-trunk --reason")
                 trace.emit("trunk-exception", ref=ref, reason=authorized["reason"])
@@ -335,6 +399,10 @@ def wrapper(args):
         url = urls[0]
         advertised = git("ls-remote", "--refs", url).stdout
         before = dict(line.split()[::-1] for line in advertised.splitlines())
+        # The default branch of the remote is protected as trunk, whatever it
+        # is called. A remote whose default branch is "trunk" would otherwise
+        # publish to it without the exception that main and master require.
+        trunk = default_branch_ref(url)
         hashlen = len(git("hash-object", "--stdin").stdout.strip())
         updates, refspecs = [], []
         for spec in opt.refspec:
@@ -352,8 +420,9 @@ def wrapper(args):
             old = before.get(ref, "0" * hashlen)
             if zero(new) and zero(old):
                 raise Rejected("cannot delete absent remote ref")
-            if ref in ("refs/heads/main", "refs/heads/master") and (not opt.allow_trunk or not opt.reason.strip()):
-                raise Rejected("trunk exception requires --allow-trunk --reason TEXT")
+            if ref in TRUNK_REFS or ref == trunk:
+                if not opt.allow_trunk or not opt.reason.strip():
+                    raise Rejected("trunk exception requires --allow-trunk --reason TEXT")
             if ref.startswith("refs/tags/") and old != new and not zero(old) and not opt.rewrite and not opt.delete:
                 raise Rejected("tag replacement requires --rewrite")
             if not zero(new) and not zero(old) and git("merge-base", "--is-ancestor", old, new, check=False).returncode and not opt.rewrite:

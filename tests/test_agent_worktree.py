@@ -223,7 +223,7 @@ class WorktreeTests(LifecycleFixture):
         diagnosed = self.wt('reconcile', self.repo, '--json')
         self.assertEqual(diagnosed.returncode, 0, diagnosed.stdout)
         self.assertEqual(old.read_bytes(), before)
-        migrated = self.wt('migrate', self.repo)
+        migrated = self.wt('migrate', self.repo, '--reason', 'legacy registry upgrade')
         self.assertEqual(migrated.returncode, 0, migrated.stderr)
         self.assertEqual(json.loads(self.wt('identity', row['path'], '--json').stdout)['session'], 's1')
 

@@ -125,3 +125,76 @@ class WrapperTests(PublishFixture):
         self.push("origin", "HEAD:refs/heads/topic")
         p = self.command(str(ROOT / "bin/agent-lock"), "check", str(self.repo), "--branch", "topic", "--agent", "test-agent", "--session", "test-session", "--json")
         self.assertEqual(json.loads(p.stdout)["status"], "owned")
+
+    def test_annotated_tag_is_verifiable_under_required_mode(self):
+        # An annotated tag announces the tag object, not the commit. The
+        # verifier receives the announced object and the checkout holds the
+        # peeled commit, so the verifier has to resolve the tag.
+        verifier = self.base / "verify-tag.sh"
+        verifier.write_text(
+            "#!/bin/sh\n"
+            "set -e\n"
+            'test "$(git cat-file -t "$1")" = "tag" || { echo "not a tag object: $1" >&2; exit 1; }\n'
+            'test "$(git rev-parse --verify "$1^{commit}")" = "$(git rev-parse HEAD)" || '
+            '{ echo "checkout differs from the tag target" >&2; exit 1; }\n'
+        )
+        verifier.chmod(0o755)
+        self.git("tag", "-a", "v1", "-m", "release one")
+        tag_object = self.git("rev-parse", "v1").stdout.strip()
+        self.assertEqual(self.git("cat-file", "-t", tag_object).stdout.strip(), "tag")
+        self.git("config", "agent.pushVerifyMode", "required")
+        self.git("config", "agent.pushVerify", str(verifier))
+        self.push("origin", "v1:refs/tags/v1")
+        published = self.git("--git-dir", str(self.remote), "rev-parse", "refs/tags/v1").stdout.strip()
+        self.assertEqual(published, tag_object)
+        self.assertTrue(any(e["event"] == "verification" and e.get("result") == "passed" for e in self.events()))
+
+    def test_remote_default_branch_is_protected_as_trunk(self):
+        # A remote whose default branch is not main or master still gets the
+        # trunk protection.
+        self.git("--git-dir", str(self.remote), "symbolic-ref", "HEAD", "refs/heads/trunk")
+        self.git("push", "-q", "origin", "HEAD:refs/heads/trunk")
+        self.commit("next")
+        p = self.push("origin", "HEAD:refs/heads/trunk", check=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("trunk exception requires", p.stderr)
+
+    def test_hook_rejects_a_remote_that_moved_after_authorization(self):
+        # Git announces the live remote value as "old", not the local
+        # tracking ref, so the hook and the wrapper normally agree. They
+        # disagree when the remote moves between the authorization and the
+        # push, and then the publication is refused instead of assuming the
+        # authorized state still holds.
+        mid = self.commit("mid")
+        sha = self.commit("next")
+        updates = [dict(ref="refs/heads/topic", old=self.first, new=sha)]
+        token = self.authorization(updates)
+        # A concurrent publisher advances the remote to an intermediate commit
+        # after the authorization was issued. The push is still a
+        # fast-forward, so Git calls the hook, and the hook sees an "old"
+        # that the authorization does not cover.
+        self.git("push", "-q", "origin", mid + ":refs/heads/other")
+        self.git("--git-dir", str(self.remote), "update-ref", "refs/heads/topic", mid)
+        env = dict(self.env, AGENT_PUSH_AUTH=str(token))
+        p = self.git("push", "origin", "HEAD:refs/heads/topic", env=env, check=False)
+        self.assertNotEqual(p.returncode, 0)
+        # The authorization binds the exact ref set and SHAs, and the hook
+        # names the ref that moved.
+        self.assertIn("moved since the publication was authorized", p.stderr)
+        self.assertEqual(self.remote_sha(), mid)
+
+    def test_hook_refuses_a_ref_that_moved_under_a_matching_authorization(self):
+        # The hook compares the announced "old" with the one the wrapper
+        # observed. A ref that moved in between is refused with a specific
+        # message, instead of being judged on a stale assumption.
+        mid = self.commit("mid")
+        sha = self.commit("next")
+        token = self.authorization([dict(ref="refs/heads/topic", old=mid, new=sha)])
+        # The remote sits at a different value than the authorization observed.
+        self.git("push", "-q", "origin", mid + ":refs/heads/other")
+        self.git("--git-dir", str(self.remote), "update-ref", "refs/heads/topic", self.first)
+        env = dict(self.env, AGENT_PUSH_AUTH=str(token))
+        p = self.git("push", "origin", "HEAD:refs/heads/topic", env=env, check=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("moved since the publication was authorized", p.stderr)
+        self.assertEqual(self.remote_sha(), self.first)

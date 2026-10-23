@@ -52,6 +52,37 @@ class RecoveryTests(LifecycleFixture):
         self.assertEqual(first['acquired'], second['acquired'])
         self.assertGreater(second['expires_epoch'], first['expires_epoch'])
 
+    def test_open_and_close_are_audited(self):
+        # Opening a session and closing it, with or without deleting the
+        # branch, leave a trace. A deleted branch is a destructive step and
+        # must not be invisible.
+        opened = self.opened('audited')
+        audit_file = Path(self.state) / (json.loads(self.state_file().read_text())['repo_id'] + '.audit.jsonl')
+        events = [json.loads(line) for line in audit_file.read_text().splitlines()] if audit_file.exists() else []
+        self.assertIn('worktree-open', [e['event'] for e in events])
+        closed = self.wt('close', self.repo, '--agent', 'codex', '--session', 'audited', '--json')
+        self.assertEqual(closed.returncode, 0, closed.stderr)
+        events = [json.loads(line) for line in audit_file.read_text().splitlines()]
+        self.assertIn('worktree-close', [e['event'] for e in events])
+        close_event = next(e for e in events if e['event'] == 'worktree-close')
+        self.assertEqual(close_event['session'], 'audited')
+        self.assertEqual(close_event['previous']['branch'], opened['branch'])
+        self.assertFalse(close_event['previous']['branch_pruned'])
+
+    def test_migration_requires_a_reason(self):
+        # The README says the legacy state migrates with a reason. The worktree
+        # migration has to require it like the lock migration does.
+        source = self.state / 'old-path.json'
+        source.write_text(json.dumps([]))
+        refused = self.wt('migrate', self.repo, '--json')
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn('reason', json.loads(refused.stdout)['error'])
+        accepted = self.wt('migrate', self.repo, '--reason', 'legacy upgrade', '--json')
+        self.assertEqual(accepted.returncode, 0, accepted.stdout)
+        audit_file = Path(self.state) / (json.loads(self.state_file().read_text())['repo_id'] + '.audit.jsonl')
+        events = [json.loads(line) for line in audit_file.read_text().splitlines()] if audit_file.exists() else []
+        self.assertIn('worktree-migrate', [e['event'] for e in events])
+
     def test_legacy_orphans_preserved_while_active_sessions_migrate(self):
         active = self.opened('active')
         orphan = dict(active, session='orphan', path=str(Path(self.tmp) / 'missing-worktree'), branch='agent/codex/orphan')
@@ -60,7 +91,7 @@ class RecoveryTests(LifecycleFixture):
         source = self.state / 'old-path.json'
         source.write_text(json.dumps([active, orphan]))
         before = source.read_bytes()
-        migrated = self.wt('migrate', self.repo, '--json')
+        migrated = self.wt('migrate', self.repo, '--reason', 'legacy registry upgrade', '--json')
         self.assertEqual(migrated.returncode, 0, migrated.stdout)
         rows = json.loads(self.state_file().read_text())['sessions']
         self.assertEqual({r['session']: r['lifecycle'] for r in rows}, {'active': 'active', 'orphan': 'orphan'})
