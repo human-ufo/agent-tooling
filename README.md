@@ -24,6 +24,11 @@ git -C /ruta/al/agent-tooling config agent.pushVerify /ruta/al/agent-tooling/bin
 # documentación. También con ruta ABSOLUTA.
 git -C /ruta/al/personal-docs config agent.pushVerifyMode required
 git -C /ruta/al/personal-docs config agent.pushVerify /ruta/al/agent-tooling/bin/agent-verify-docs
+# Para cualquier repositorio con una suite de tests en `tests/`, el verificador
+# genérico corre esa suite sobre el contenido del commit anunciado. El
+# directorio de la suite es el primer argumento; el SHA lo anade el hook.
+git -C /ruta/al/repo config agent.pushVerifyMode required
+git -C /ruta/al/repo config agent.pushVerify /ruta/al/agent-tooling/bin/agent-verify-tests tests
 
 # Sesión: la base se obtiene del default branch remoto, nunca de HEAD sucio.
 agent-worktree open /ruta/al/repo --agent codex --session tarea-123 --branch agent/tarea-123

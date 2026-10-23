@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Verificador de publicación para un repositorio con suite de tests.
+#
+# `agent.pushVerify` ejecuta este script en un checkout descartable del SHA
+# anunciado, con el directorio de trabajo en ese checkout, y le pasa el SHA
+# como argumento final. Por eso:
+#
+#   - el SHA tiene que coincidir con el HEAD del checkout: si no, el checkout
+#     no corresponde a lo que se va a publicar;
+#   - la suite se corre sobre el contenido del checkout, o sea el del commit
+#     anunciado, y no sobre el árbol de trabajo de quien empuja;
+#   - la ruta de la suite es relativa al checkout, porque ahí está el código
+#     que se publica.
+#
+# Uso:
+#   agent-verify-tests <directorio-de-tests> [patrón] <sha>
+#
+# El hook llama al verificador con el SHA anunciado como último argumento.
+# El directorio de la suite y el patrón se pueden fijar con variables de
+# entorno, para que la configuración del repositorio no tenga que depender de
+# cómo se invocan los argumentos.
+set -Eeuo pipefail
+
+suite="${AGENT_VERIFY_SUITE:-tests}"
+pattern="${AGENT_VERIFY_PATTERN:-test_*.py}"
+
+# Los argumentos son opcionales: el hook siempre anade el SHA al final.
+if [[ $# -ge 1 && "$1" != --* ]]; then
+  suite="$1"
+  shift
+fi
+if [[ $# -ge 2 && "$1" != --* ]]; then
+  pattern="$1"
+  shift
+fi
+
+if [[ "${1:-}" == "--help" ]]; then
+  sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+  exit 0
+fi
+
+[[ $# -ge 1 ]] || { echo 'expected the announced SHA as the last argument' >&2; exit 2; }
+announced="${!#}"
+
+resolved="$(git rev-parse --verify "${announced}^{commit}" 2>/dev/null || true)"
+[[ -n "$resolved" ]] || { echo "announced object is not a commit in this checkout: ${announced}" >&2; exit 1; }
+head_sha="$(git rev-parse HEAD 2>/dev/null || true)"
+[[ "$head_sha" == "$resolved" ]] || { echo 'verification checkout differs from the pushed commit' >&2; exit 1; }
+
+if [[ ! -d "$suite" ]]; then
+  echo "the suite directory is not in the published content: ${suite}" >&2
+  exit 1
+fi
+
+output="$(python3 -m unittest discover -s "$suite" -p "$pattern" 2>&1)"
+status=$?
+printf '%s\n' "$output"
+# unittest returns 5 when it found no test at all. That is not a pass: a
+# verifier that runs nothing would approve anything.
+if [[ $status -eq 5 ]]; then
+  echo 'the verification suite did not run any test' >&2
+  exit 1
+fi
+exit $status
