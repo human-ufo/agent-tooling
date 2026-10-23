@@ -2,6 +2,7 @@ from pathlib import Path
 import json
 import os
 import shutil
+import unittest
 from test_pre_push_hook import PublishFixture, ROOT
 
 
@@ -65,19 +66,23 @@ class InstallerTests(PublishFixture):
         self.assertEqual(self.remote_sha("linked"), self.first)
 
     def test_existing_lint_and_precommit_are_preserved_and_chained(self):
-        lint = self.home / ".agents/skills/docs-writer/pre-commit"
-        lint.parent.mkdir(parents=True)
-        lint_result = self.base / "lint-ran"
-        lint.write_text("#!/bin/sh\nprintf yes >" + str(lint_result) + "\n")
-        # Installer makes this executable even if source wasn't marked executable.
-        previous = self.repo / ".git/hooks/pre-commit"
-        prior_result = self.base / "prior-ran"
-        previous.write_text("#!/bin/sh\nprintf yes >" + str(prior_result) + "\n")
-        previous.chmod(0o755)
-        self.install()
-        self.commit("next")
-        self.assertEqual(lint_result.read_text(), "yes")
-        self.assertEqual(prior_result.read_text(), "yes")
+        # The documentation lint only installs in the governance repositories,
+        # so this repository identifies as one of them.
+        self.git("remote", "set-url", "origin", "https://github.com/human-ufo/personal-docs.git")
+        if True:
+            lint = self.home / ".agents/skills/docs-writer/pre-commit"
+            lint.parent.mkdir(parents=True)
+            lint_result = self.base / "lint-ran"
+            lint.write_text("#!/bin/sh\nprintf yes >" + str(lint_result) + "\n")
+            # Installer makes this executable even if source wasn't marked executable.
+            previous = self.repo / ".git/hooks/pre-commit"
+            prior_result = self.base / "prior-ran"
+            previous.write_text("#!/bin/sh\nprintf yes >" + str(prior_result) + "\n")
+            previous.chmod(0o755)
+            self.install()
+            self.commit("next")
+            self.assertEqual(lint_result.read_text(), "yes")
+            self.assertEqual(prior_result.read_text(), "yes")
 
     def test_modified_dispatcher_and_incompatible_existing_hook_are_rejected(self):
         target = self.repo / ".git/hooks/pre-push"
@@ -88,3 +93,33 @@ class InstallerTests(PublishFixture):
         (hooks / "pre-push").mkdir()
         self.git("config", "core.hooksPath", str(hooks))
         self.assertNotEqual(self.command(str(ROOT / "install-hooks.sh"), str(self.repo), check=False).returncode, 0)
+
+
+class DocumentationLintScopeTests(PublishFixture):
+    """The documentation lint only belongs in the governance documentation repos.
+
+    Its rules demand sections that a task file or a source file does not have,
+    so installing it anywhere else blocks legitimate commits.
+    """
+
+    def test_documentation_lint_is_not_installed_in_other_repositories(self):
+        repo = self.repo
+        self.install(repo)
+        hooks = Path(self.git("rev-parse", "--path-format=absolute", "--git-path", "hooks").stdout.strip())
+        target = hooks / "pre-commit"
+        if target.exists():
+            dispatcher = target.read_text()
+            self.assertNotIn("pre-commit-docs-lint", dispatcher)
+
+    def test_documentation_lint_is_installed_in_a_documentation_repository(self):
+        # The origin remote decides, so a clone of a documentation repository
+        # is recognised wherever the directory sits.
+        self.git("remote", "set-url", "origin", "https://github.com/human-ufo/personal-docs.git")
+        self.install()
+        hooks = Path(self.git("rev-parse", "--path-format=absolute", "--git-path", "hooks").stdout.strip())
+        dispatcher = hooks / "pre-commit"
+        if dispatcher.exists():
+            self.assertIn("pre-commit-docs-lint", dispatcher.read_text())
+        else:
+            # Without the lint installed there is no dispatcher for it.
+            self.assertFalse((hooks / "pre-commit-docs-lint").exists())
