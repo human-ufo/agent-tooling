@@ -123,3 +123,28 @@ class DocumentationLintScopeTests(PublishFixture):
         else:
             # Without the lint installed there is no dispatcher for it.
             self.assertFalse((hooks / "pre-commit-docs-lint").exists())
+
+
+class RemovedHookTests(PublishFixture):
+    """A hook that leaves the payload has to be removed from the repository."""
+
+    def test_documentation_lint_is_removed_when_it_no_longer_applies(self):
+        # The lint source has to exist, otherwise it is never installed.
+        lint = self.home / ".agents/skills/docs-writer/pre-commit"
+        lint.parent.mkdir(parents=True, exist_ok=True)
+        lint.write_text("#!/bin/sh\nexit 0\n")
+        lint.chmod(0o755)
+        # First install it as if the repository were a documentation one.
+        self.git("remote", "set-url", "origin", "https://github.com/human-ufo/personal-docs.git")
+        self.install()
+        hooks = Path(self.git("rev-parse", "--path-format=absolute", "--git-path", "hooks").stdout.strip())
+        dispatcher = hooks / "pre-commit"
+        self.assertTrue(dispatcher.is_file())
+        self.assertIn("docs-lint", dispatcher.read_text())
+        # Now the repository is not a documentation one any more.
+        self.git("remote", "set-url", "origin", str(self.remote))
+        self.install()
+        if dispatcher.exists():
+            self.assertNotIn("docs-lint", dispatcher.read_text())
+        else:
+            self.assertFalse((hooks / "pre-commit").exists())

@@ -603,6 +603,23 @@ def install_one(repo, hooks):
     sources = {"pre-push": runtime / "hooks/pre-push"}
     if "pre-commit" in names:
         sources["pre-commit"] = runtime / "hooks/pre-commit-docs-lint"
+    # A hook that is no longer part of the payload has to be removed: the
+    # documentation lint does not apply outside the governance repositories,
+    # and leaving it installed blocks legitimate commits.
+    for name in sorted(set(manifest["hooks"]) - set(sources)):
+        entry = manifest["hooks"].pop(name)
+        target = hooks / name
+        previous = entry.get("previous", [])
+        backup = entry.get("backup")
+        if previous:
+            body = dispatcher([[str(p)] for p in previous])
+            temp_target = hooks / (name + ".new")
+            temp_target.write_text(body)
+            temp_target.chmod(0o755)
+            temp_target.replace(target)
+        elif target.exists() or target.is_symlink():
+            target.unlink()
+        print("removed: " + str(target))
     # Snapshot all targets, then atomically replace each dispatcher. If any write
     # fails, restore every target and the old manifest before releasing the lock.
     created_backups, changed = [], []
