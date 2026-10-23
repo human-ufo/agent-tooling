@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# agent.pushVerify helper: Git calls this in a disposable checkout with its SHA.
+set -Eeuo pipefail
+[[ $# -eq 1 ]] || { echo 'expected commit SHA' >&2; exit 2; }
+[[ "$(git rev-parse HEAD)" == "$1" ]] || { echo 'verification checkout differs from pushed commit' >&2; exit 1; }
+exec python3 -m unittest discover -s tests -v
