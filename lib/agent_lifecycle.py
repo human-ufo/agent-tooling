@@ -33,11 +33,22 @@ class Unmanaged(Failure):
     pass
 
 
-def git(path, *args, check=True):
-    p = subprocess.run(['git', '-C', str(path), *args], capture_output=True, text=True)
+def git(path, *args, check=True, env=None):
+    p = subprocess.run(['git', '-C', str(path), *args], capture_output=True, text=True, env=env)
     if check and p.returncode:
         raise Failure(p.stderr.strip() or f'git {args[0]} failed')
     return p
+
+
+def git_c(path, *args, check=True):
+    """Run Git with the messages in a known language.
+
+    Git translates its output according to the locale, and the conflict types
+    of merge-tree are part of that output. Forcing the C locale keeps the
+    types comparable across machines.
+    """
+    env = dict(os.environ, LC_ALL='C', LANG='C')
+    return git(path, *args, check=check, env=env)
 
 
 def iso():
@@ -350,6 +361,38 @@ def missing_worktree_close_oid(repo, rec):
     return None, None
 
 
+def merge_tree_conflicts(output):
+    """Extract the conflicted paths and their types from a merge-tree output.
+
+    Git localizes its conflict messages, so the prose is not a reliable
+    source: the same command answers "CONFLICT (add/add)" in English and
+    "CONFLICTO (agregar/agregar)" in Spanish. The machine-readable part of
+    the output is the list of stages, where every conflicted file appears
+    with its stage numbers, and that part does not depend on the locale.
+    """
+    conflicts = []
+    stage_paths = []
+    for line in output.splitlines():
+        stage = re.match(r'^\d+\s+[0-9a-f]+\s+([123])\t(.+)$', line)
+        if stage:
+            path = stage.group(2).strip()
+            if path not in stage_paths:
+                stage_paths.append(path)
+            continue
+        match = re.match(r'^CONFLICT \(([^)]+)\):', line)
+        if match:
+            conflicts.append({'type': match.group(1).strip(), 'path': None})
+    # The stage list gives the paths in order; the conflict lines give the
+    # types in order. When the counts differ, every conflicted path is
+    # reported with the type it could be matched to, and the rest keep the
+    # unknown type instead of a wrong one.
+    for index, row in enumerate(conflicts):
+        row['path'] = stage_paths[index] if index < len(stage_paths) else None
+    if not conflicts and stage_paths:
+        conflicts = [{'type': 'unknown', 'path': path} for path in stage_paths]
+    return conflicts
+
+
 def detect_collisions(repo, source_oid, source_label, targets, exclude_branch=None):
     """Replay a three-way merge in memory to find textual collisions.
 
@@ -364,7 +407,7 @@ def detect_collisions(repo, source_oid, source_label, targets, exclude_branch=No
             continue
         if exclude_branch and label == exclude_branch:
             continue
-        p = git(repo['repo'], 'merge-tree', '--write-tree', oid, source_oid, check=False)
+        p = git_c(repo['repo'], 'merge-tree', '--write-tree', oid, source_oid, check=False)
         if p.returncode == 0:
             continue
         if p.returncode != 1:
@@ -373,12 +416,7 @@ def detect_collisions(repo, source_oid, source_label, targets, exclude_branch=No
             collisions.append({'target': label, 'type': 'unknown', 'paths': [],
                                'detail': (p.stderr or p.stdout).strip()[:200]})
             continue
-        paths = []
-        for line in p.stdout.splitlines():
-            match = re.match(r'^CONFLICT \(([^)]+)\): (?:Merge conflict in )?(.+?)(?:  Version .*)?$', line)
-            if match:
-                kind, path = match.group(1), match.group(2).strip()
-                paths.append({'type': kind, 'path': path})
+        paths = merge_tree_conflicts(p.stdout)
         collisions.append({'target': label, 'type': 'collision', 'paths': paths})
     return {'source': source_label, 'collisions': collisions,
             'status': 'conflict' if collisions else 'clean'}

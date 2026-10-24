@@ -3,10 +3,12 @@
 Everything runs against local repositories and local bare remotes. No external
 remote and no production credential is involved.
 """
+import importlib.util
 import json
 import os
 from pathlib import Path
 import time
+import unittest
 
 from test_agent_worktree import LifecycleFixture
 from test_pre_push_hook import PublishFixture, ROOT
@@ -222,3 +224,42 @@ class PushRadarNoticeTests(PublishFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("collision detected", result.stderr)
         self.assertFalse(any(e["event"] == "collision-radar" for e in self.events()))
+
+
+class MergeTreeParsingTests(unittest.TestCase):
+    """The conflict types must not depend on the locale of the machine."""
+
+    def test_the_types_and_paths_are_read_from_the_machine_readable_output(self):
+        spec = importlib.util.spec_from_file_location('lifecycle_under_test', ROOT / 'lib/agent_lifecycle.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        english = (
+            "tree\n"
+            "100644 aaaaaaaa 1\tf.txt\n"
+            "100644 bbbbbbbb 2\tf.txt\n"
+            "100644 cccccccc 3\tf.txt\n"
+            "\n"
+            "Auto-merging f.txt\n"
+            "CONFLICT (add/add): Merge conflict in f.txt\n"
+        )
+        spanish = (
+            "tree\n"
+            "100644 aaaaaaaa 1\tf.txt\n"
+            "100644 bbbbbbbb 2\tf.txt\n"
+            "100644 cccccccc 3\tf.txt\n"
+            "\n"
+            "Auto-fusionando f.txt\n"
+            "CONFLICTO (agregar/agregar): Conflicto de fusión en f.txt\n"
+        )
+        rows = module.merge_tree_conflicts(english)
+        self.assertEqual(rows, [{'type': 'add/add', 'path': 'f.txt'}])
+        # The localized output still yields the path from the stage list.
+        localized = module.merge_tree_conflicts(spanish)
+        self.assertEqual(localized[0]['path'], 'f.txt')
+
+    def test_a_conflict_without_a_known_type_is_reported_as_unknown(self):
+        spec = importlib.util.spec_from_file_location('lifecycle_under_test', ROOT / 'lib/agent_lifecycle.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        rows = module.merge_tree_conflicts("100644 aaaaaaaa 1\tother.txt\n")
+        self.assertEqual(rows, [{'type': 'unknown', 'path': 'other.txt'}])
