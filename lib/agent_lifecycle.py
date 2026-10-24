@@ -299,12 +299,186 @@ def report(args, payload):
         print(payload.get('message', json.dumps(payload, sort_keys=True)))
 
 
+def lock_path(root, repo, branch):
+    """The canonical lock file for a branch inside a repository identity."""
+    return root / f"{repo['repo_id']}.{digest(branch)}.lock"
+
+
+def release_own_lock(root, repo, branch, agent, session, args, reason):
+    """Release the lock of this branch when this session owns it.
+
+    A session that ends its worktree must not leave its branch locked, because
+    the next session on the same branch would be refused by a stale lock. Only
+    the lock of the same actor and session is touched; an expired lock of this
+    session is released too, because the owner is exactly the one that is
+    closing. A lock of another actor is never removed, not even when expired.
+    """
+    file = lock_path(root, repo, branch)
+    if not file.exists():
+        return None
+    try:
+        data = read_json(file)
+    except Failure:
+        return {'status': 'malformed', 'branch': branch}
+    if not isinstance(data, dict):
+        return {'status': 'malformed', 'branch': branch}
+    if data.get('agent') != agent or data.get('session') != session:
+        return {'status': 'foreign', 'branch': branch,
+                'owner': {'agent': data.get('agent'), 'session': data.get('session')}}
+    audit(root, 'lock-release', args, repo, data)
+    file.unlink(missing_ok=True)
+    return {'status': 'released', 'branch': branch, 'expired': data.get('expires_epoch', 0) <= time.time()}
+
+
+def missing_worktree_close_oid(repo, rec):
+    """Prove that the commit of a vanished worktree is still preserved.
+
+    The worktree directory can disappear without the tool being the one that
+    removed it. The record must not be dropped until the commit of its branch
+    is proven to be reachable somewhere else, because the branch is the only
+    reference that keeps a local-only commit alive.
+    """
+    ref = f"refs/heads/{rec['branch']}"
+    current = git(repo['repo'], 'rev-parse', '--verify', ref, check=False)
+    if current.returncode == 0:
+        oid = current.stdout.strip()
+        if re.fullmatch(r'[a-f0-9]{40,64}', oid):
+            return oid, 'local branch'
+    # The branch itself is gone. The commit of the session cannot be identified
+    # from the record alone, and the base commit of the session says nothing
+    # about the work it did, so nothing is proven and the record is retained.
+    return None, None
+
+
+def detect_collisions(repo, source_oid, source_label, targets, exclude_branch=None):
+    """Replay a three-way merge in memory to find textual collisions.
+
+    git merge-tree --write-tree computes the merge without touching any working
+    tree or index, so the check is safe to run while other sessions work. It
+    detects the textual layer of conflicts only: content overlaps and the
+    structural modify/delete and add/add cases.
+    """
+    collisions = []
+    for label, oid in targets:
+        if not oid or not re.fullmatch(r'[a-f0-9]{40,64}', oid):
+            continue
+        if exclude_branch and label == exclude_branch:
+            continue
+        p = git(repo['repo'], 'merge-tree', '--write-tree', oid, source_oid, check=False)
+        if p.returncode == 0:
+            continue
+        if p.returncode != 1:
+            # A merge that cannot even be computed is reported as unknown
+            # rather than as a clean result.
+            collisions.append({'target': label, 'type': 'unknown', 'paths': [],
+                               'detail': (p.stderr or p.stdout).strip()[:200]})
+            continue
+        paths = []
+        for line in p.stdout.splitlines():
+            match = re.match(r'^CONFLICT \(([^)]+)\): (?:Merge conflict in )?(.+?)(?:  Version .*)?$', line)
+            if match:
+                kind, path = match.group(1), match.group(2).strip()
+                paths.append({'type': kind, 'path': path})
+        collisions.append({'target': label, 'type': 'collision', 'paths': paths})
+    return {'source': source_label, 'collisions': collisions,
+            'status': 'conflict' if collisions else 'clean'}
+
+
+def active_branches(repo, records, exclude_session=None):
+    """Branches of the sessions that are currently open, with their tip."""
+    rows = []
+    for rec in records:
+        if rec.get('lifecycle', 'active') != 'active':
+            continue
+        if exclude_session and rec['session'] == exclude_session:
+            continue
+        ref = f"refs/heads/{rec['branch']}"
+        oid = git(repo['repo'], 'rev-parse', '--verify', ref, check=False)
+        if oid.returncode:
+            continue
+        rows.append({'session': rec['session'], 'agent': rec['agent'], 'branch': rec['branch'],
+                     'oid': oid.stdout.strip()})
+    return rows
+
+
+def default_branch_oid(repo, remote='origin'):
+    """Resolve the default branch of a remote and its locally known tip.
+
+    The remote is the authority for which branch is the default, because that
+    is the branch that will receive the merges. The tip is read from the local
+    tracking ref, so the radar does not have to reach the network.
+    """
+    output = git(repo['repo'], 'ls-remote', '--symref', remote, 'HEAD', check=False).stdout.splitlines()
+    ref = next((line.split()[1] for line in output if line.startswith('ref: ')), '')
+    if not ref.startswith('refs/heads/'):
+        return None, None
+    name = ref[len('refs/heads/'):]
+    for candidate in (f'refs/remotes/{remote}/{name}', 'refs/remotes/origin/HEAD'):
+        oid = git(repo['repo'], 'rev-parse', '--verify', '--quiet', candidate, check=False)
+        if oid.returncode == 0:
+            return ref, oid.stdout.strip()
+    return ref, None
+
+
+def radar(args, repo):
+    """Report textual collisions between the session and the other branches.
+
+    The check runs entirely in memory through git merge-tree, so it never
+    touches a working tree and it never blocks anything. It answers one
+    question: which files of this session collide with the work of another
+    session or with the default branch of the remote.
+    """
+    root = directory('worktrees')
+    _, records = registry(root, repo, allow_legacy=True)
+    top = os.path.realpath(git(repo['repo'], 'rev-parse', '--show-toplevel').stdout.strip())
+    rec = None
+    if args.session:
+        matches = [r for r in records if r['session'] == args.session]
+        if matches:
+            rec = matches[0]
+    else:
+        rec = next((r for r in records if os.path.realpath(r['path']) == top), None)
+    if rec:
+        oid = git(repo['repo'], 'rev-parse', '--verify', f"refs/heads/{rec['branch']}", check=False)
+        if oid.returncode:
+            raise Failure('session branch has no commit to compare yet')
+        source = {'session': rec['session'], 'agent': rec['agent'], 'branch': rec['branch'],
+                  'oid': oid.stdout.strip(), 'worktree': rec['path']}
+    else:
+        # A checkout that is not a managed worktree, or a session that is not
+        # registered, still has a branch to compare, so the radar is useful
+        # outside a managed session.
+        branch = git(repo['repo'], 'symbolic-ref', '--quiet', '--short', 'HEAD', check=False).stdout.strip()
+        oid = git(repo['repo'], 'rev-parse', '--verify', 'HEAD', check=False)
+        if not branch or oid.returncode:
+            raise Failure('no branch to compare; pass --session <stable-id>')
+        source = {'session': None, 'agent': None, 'branch': branch,
+                  'oid': oid.stdout.strip(), 'worktree': top}
+    targets = []
+    default_ref, default_oid = default_branch_oid(repo, args.remote)
+    if default_ref and default_oid:
+        targets.append((default_ref, default_oid))
+    for row in active_branches(repo, records, exclude_session=source['session']):
+        targets.append((row['branch'], row['oid']))
+    result = detect_collisions(repo, source['oid'], source['branch'], targets)
+    result['repo_id'] = repo['repo_id']
+    result['source'] = source
+    result['sessions'] = active_branches(repo, records)
+    report(args, result)
+    return 0
+
+
 def worktree_command(args):
     repo = repository(args.repo)
     root = directory('worktrees')
     if args.command == 'identity':
         report(args, identity(args, repo))
         return 0
+    if args.command == 'radar':
+        # The radar only reads state and replays merges in memory, so it does
+        # not take the session mutex: it must be usable while other sessions
+        # are working.
+        return radar(args, repo)
     with serialized(root, repo['repo_id']):
         if args.command == 'reconcile':
             file, records = registry(root, repo, allow_legacy=True)
@@ -420,9 +594,37 @@ def worktree_command(args):
             if not preserved:
                 raise Failure('interrupted close commit preservation unproven; registry retained; inspect manually')
             save_registry(file, repo, [r for r in records if r['session'] != rec['session']])
-            report(args, {'message': f'interrupted close completed for {rec["session"]}; commit preserved', 'repo_id': repo['repo_id'], 'branch': rec['branch'], 'branch_retained': current.returncode == 0})
+            released = release_own_lock(directory('locks'), repo, rec['branch'], rec['agent'], rec['session'], args, 'auto-released on interrupted close')
+            report(args, {'message': f'interrupted close completed for {rec["session"]}; commit preserved', 'repo_id': repo['repo_id'], 'branch': rec['branch'], 'branch_retained': current.returncode == 0, 'lock': released})
             return 0
         if not actual or not path.is_dir() or actual.get('branch') != f"refs/heads/{rec['branch']}":
+            # The worktree directory can disappear without this tool removing
+            # it, for example with a direct `git worktree remove`. The record
+            # must not be dropped silently: the commit of the branch has to be
+            # proven preserved first, otherwise the last reference to a local
+            # commit would disappear with the record.
+            oid, proof = missing_worktree_close_oid(repo, rec)
+            if not oid:
+                raise Failure('session worktree missing and branch commit preservation unproven; registry retained; inspect manually')
+            if not actual and not path.exists():
+                branch_ref = f"refs/heads/{rec['branch']}"
+                if args.prune:
+                    # Pruning deletes the branch, so the commit has to be
+                    # proven to live on a remote head first. A local-only
+                    # commit would lose its last reference.
+                    if not remote_preservation(repo, oid):
+                        raise Failure('branch contains local-only work or squash integration is unproven; retained; close without --prune')
+                save_registry(file, repo, [r for r in records if r['session'] != rec['session']])
+                if args.prune:
+                    git(repo['repo'], 'update-ref', '-d', branch_ref, oid)
+                released = release_own_lock(directory('locks'), repo, rec['branch'], rec['agent'], rec['session'], args, 'auto-released on close of a vanished worktree')
+                audit(root, 'worktree-close', args, repo, {'branch': rec['branch'], 'branch_oid': oid,
+                                                            'branch_pruned': bool(args.prune), 'worktree': str(path),
+                                                            'worktree_absent': True, 'preservation': proof})
+                report(args, {'message': f'session {rec["session"]} closed; worktree was already absent; commit preserved ({proof})',
+                              'repo_id': repo['repo_id'], 'branch': rec['branch'], 'branch_retained': not args.prune,
+                              'commit': oid, 'preservation': proof, 'lock': released})
+                return 0
             raise Failure('session worktree missing or branch changed; run reconcile; record retained')
         # Even --force cannot discard untracked, ignored, or tracked user files.
         dirty = git(path, 'status', '--porcelain', '--untracked-files=all', '--ignored=matching').stdout
@@ -453,7 +655,10 @@ def worktree_command(args):
         # the record of the session ends here.
         audit(root, 'worktree-close', args, repo, {'branch': rec['branch'], 'branch_oid': branch_oid,
                                                    'branch_pruned': bool(args.prune), 'worktree': str(path)})
-        report(args, {'message': f'session {rec["session"]} closed; branch {rec["branch"]} ' + ('pruned' if args.prune else 'retained'), 'branch': rec['branch'], 'branch_retained': not args.prune, 'repo_id': repo['repo_id']})
+        # The session is over, so its own lock on that branch is released here.
+        # A lock of another actor is left untouched.
+        released = release_own_lock(directory('locks'), repo, rec['branch'], rec['agent'], rec['session'], args, 'auto-released on worktree close')
+        report(args, {'message': f'session {rec["session"]} closed; branch {rec["branch"]} ' + ('pruned' if args.prune else 'retained'), 'branch': rec['branch'], 'branch_retained': not args.prune, 'repo_id': repo['repo_id'], 'lock': released})
         return 0
 
 
@@ -559,7 +764,7 @@ def main(tool=None):
         tool = sys.argv.pop(1)
     tool = tool or Path(sys.argv[0]).name
     parser = argparse.ArgumentParser(description=__doc__)
-    commands = ('open', 'close', 'path', 'identity', 'list', 'reconcile', 'migrate') if tool == 'agent-worktree' else ('acquire', 'check', 'renew', 'release', 'recover', 'list', 'reconcile', 'migrate')
+    commands = ('open', 'close', 'path', 'identity', 'list', 'reconcile', 'migrate', 'radar') if tool == 'agent-worktree' else ('acquire', 'check', 'renew', 'release', 'recover', 'list', 'reconcile', 'migrate')
     parser.add_argument('command', choices=commands, nargs='?', default='list')
     parser.add_argument('repo', nargs='?', default=None)
     parser.add_argument('--agent', default=os.environ.get('AGENT_ACTOR', os.environ.get('AGENT_NAME', getpass.getuser())))
@@ -572,6 +777,7 @@ def main(tool=None):
     parser.add_argument('--note', default='')
     parser.add_argument('--reason', default='')
     parser.add_argument('--worktree', default='')
+    parser.add_argument('--remote', default='origin')
     args = parser.parse_args()
     args.agent_explicit = '--agent' in sys.argv or 'AGENT_NAME' in os.environ or 'AGENT_ACTOR' in os.environ
     args.session_explicit = '--session' in sys.argv

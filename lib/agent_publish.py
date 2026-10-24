@@ -17,6 +17,7 @@ import json
 import math
 import os
 import re
+from contextlib import contextmanager
 from pathlib import Path
 import shlex
 import signal
@@ -248,7 +249,33 @@ def consume_authorization(common, repo_id, remote, url, actor, session, updates)
     return token
 
 
-def verify(worktree, update, trace, mode, command):
+def verify_queue_path(repo_id):
+    """The FIFO mutex that serializes verifiers of one repository.
+
+    It lives next to the locks, because it is the same kind of resource: a
+    local mutex that coordinates cooperating processes on this host.
+    """
+    directory = Path(os.getenv("AGENT_LOCK_DIR", str(Path.home() / ".cache/agent-locks")))
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / f"verify.{repo_id}.mutex"
+
+
+@contextmanager
+def verify_queue(repo_id):
+    """Serialize the verifiers of one repository.
+
+    Two sessions publishing at the same time would otherwise run two heavy
+    suites concurrently and starve each other of CPU and disk, which shows up
+    as a timeout and a false failure. The queue is FIFO and per repository, so
+    unrelated repositories keep running in parallel.
+    """
+    path = verify_queue_path(repo_id)
+    with path.open("a") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        yield
+
+
+def verify(worktree, update, trace, mode, command, repo_id=None):
     if zero(update["new"]):
         trace.emit("verification", ref=update["ref"], sha=update["new"], result="skipped", reason="deletion")
         return
@@ -259,54 +286,60 @@ def verify(worktree, update, trace, mode, command):
         argv = shlex.split(command)
         if not argv:
             raise Rejected("empty verification command")
-        with tempfile.TemporaryDirectory(prefix="agent-push-verify-") as temp:
-            checkout = Path(temp) / "checkout"
-            git("clone", "--quiet", "--shared", "--no-checkout", "--local", str(worktree), str(checkout))
-            # An annotated tag names a tag object, not a commit. Checking out
-            # the tag object resolves to its commit, so the checkout would show
-            # a different SHA than the one announced. The announced object is
-            # what the verifier has to judge, so it is passed unchanged and the
-            # tag object stays in the store for verify-tag style checks.
-            target = update["new"]
-            kind = git("cat-file", "-t", target, cwd=checkout, check=False).stdout.strip()
-            if kind == "tag":
-                git("-c", "core.hooksPath=/dev/null", "checkout", "--quiet", "--detach", target + "^{commit}", cwd=checkout)
-            else:
-                git("-c", "core.hooksPath=/dev/null", "checkout", "--quiet", "--detach", target, cwd=checkout)
-            # This is a trusted command, not a security sandbox: same UID can
-            # still read the filesystem. Ambient provider tokens are not passed.
-            allowed = {"PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "LANG", "SYSTEMROOT"}
-            additions = shlex.split(config("agent.pushVerifyEnv"))
-            for name in additions:
-                if (not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)
-                        or name.startswith(("GIT_", "AGENT_"))):
-                    raise Rejected("invalid verifier environment allowlist name")
-            allowed.update(additions)
-            env = {key: value for key, value in os.environ.items() if key in allowed or key.startswith("LC_")}
-            env.update(AGENT_VERIFY_REF=update["ref"], AGENT_VERIFY_SHA=update["new"],
-                       AGENT_VERIFY_OBJECT_TYPE=kind or "unknown",
-                       GIT_TERMINAL_PROMPT="0")
-            timeout_text = config("agent.pushVerifyTimeout") or "300"
-            try:
-                timeout = int(timeout_text)
-                if timeout < 1 or timeout > 86400:
-                    raise ValueError()
-            except ValueError as e:
-                raise Rejected("agent.pushVerifyTimeout must be 1..86400 seconds") from e
-            p = subprocess.Popen([*argv, update["new"]], cwd=checkout, env=env, start_new_session=True)
-            # The verifier receives the announced object. For an annotated tag
-            # that is the tag object, so a verifier that compares against HEAD
-            # must resolve the tag itself. The checkout is the peeled commit;
-            # AGENT_VERIFY_OBJECT_TYPE says which of the two it is.
-            try:
-                p.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                os.killpg(p.pid, signal.SIGKILL)
-                p.wait()
-                raise Rejected("verification timed out for " + update["ref"])
-            if p.returncode:
-                raise Rejected("verification failed for " + update["ref"])
-        trace.emit("verification", ref=update["ref"], sha=update["new"], result="passed")
+        started = time.monotonic()
+        with verify_queue(repo_id):
+            waited = int((time.monotonic() - started) * 1000)
+            started = time.monotonic()
+            with tempfile.TemporaryDirectory(prefix="agent-push-verify-") as temp:
+                checkout = Path(temp) / "checkout"
+                git("clone", "--quiet", "--shared", "--no-checkout", "--local", str(worktree), str(checkout))
+                # An annotated tag names a tag object, not a commit. Checking out
+                # the tag object resolves to its commit, so the checkout would show
+                # a different SHA than the one announced. The announced object is
+                # what the verifier has to judge, so it is passed unchanged and the
+                # tag object stays in the store for verify-tag style checks.
+                target = update["new"]
+                kind = git("cat-file", "-t", target, cwd=checkout, check=False).stdout.strip()
+                if kind == "tag":
+                    git("-c", "core.hooksPath=/dev/null", "checkout", "--quiet", "--detach", target + "^{commit}", cwd=checkout)
+                else:
+                    git("-c", "core.hooksPath=/dev/null", "checkout", "--quiet", "--detach", target, cwd=checkout)
+                # This is a trusted command, not a security sandbox: same UID can
+                # still read the filesystem. Ambient provider tokens are not passed.
+                allowed = {"PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "LANG", "SYSTEMROOT"}
+                additions = shlex.split(config("agent.pushVerifyEnv"))
+                for name in additions:
+                    if (not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)
+                            or name.startswith(("GIT_", "AGENT_"))):
+                        raise Rejected("invalid verifier environment allowlist name")
+                allowed.update(additions)
+                env = {key: value for key, value in os.environ.items() if key in allowed or key.startswith("LC_")}
+                env.update(AGENT_VERIFY_REF=update["ref"], AGENT_VERIFY_SHA=update["new"],
+                           AGENT_VERIFY_OBJECT_TYPE=kind or "unknown",
+                           GIT_TERMINAL_PROMPT="0")
+                timeout_text = config("agent.pushVerifyTimeout") or "300"
+                try:
+                    timeout = int(timeout_text)
+                    if timeout < 1 or timeout > 86400:
+                        raise ValueError()
+                except ValueError as e:
+                    raise Rejected("agent.pushVerifyTimeout must be 1..86400 seconds") from e
+                p = subprocess.Popen([*argv, update["new"]], cwd=checkout, env=env, start_new_session=True)
+                # The verifier receives the announced object. For an annotated tag
+                # that is the tag object, so a verifier that compares against HEAD
+                # must resolve the tag itself. The checkout is the peeled commit;
+                # AGENT_VERIFY_OBJECT_TYPE says which of the two it is.
+                try:
+                    p.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    os.killpg(p.pid, signal.SIGKILL)
+                    p.wait()
+                    raise Rejected("verification timed out for " + update["ref"])
+                if p.returncode:
+                    raise Rejected("verification failed for " + update["ref"])
+            duration = int((time.monotonic() - started) * 1000)
+        trace.emit("verification", ref=update["ref"], sha=update["new"], result="passed",
+                   queue_wait_ms=waited, run_duration_ms=duration)
     except (OSError, ValueError, subprocess.TimeoutExpired, Rejected) as e:
         trace.emit("verification", ref=update["ref"], sha=update["new"], result="failed", reason=str(e), mode=mode)
         # Configured verifiers are gating even in optional mode; optional means
@@ -364,7 +397,7 @@ def hook(args):
                 ff = git("merge-base", "--is-ancestor", old, new, check=False)
                 if ff.returncode and (not authorized or not authorized.get("rewrite")):
                     raise Rejected("non-fast-forward requires agent-push --rewrite with exact lease")
-            verify(worktree, update, trace, mode, command)
+            verify(worktree, update, trace, mode, command, repo_id=repo_id)
         trace.emit("hook-accepted", updates=updates)
         if not authorized:
             trace.emit("remote-result", result="indeterminate", reason="raw git push: pre-push cannot observe remote result")
@@ -372,6 +405,44 @@ def hook(args):
     except (Rejected, OSError) as e:
         trace.emit("reject", source="pre-push", reason=str(e))
         raise
+
+
+def radar_notice(worktree, common, repo_id, actor, session, trace, updates, remote="origin"):
+    """Warn about textual collisions with the other sessions or the trunk.
+
+    The notice never blocks the publication: publishing the branch preserves
+    the work in the remote, and refusing to publish would leave it only on the
+    local disk. It exists so the agent or the person knows before merging the
+    pull request which files will collide and with which session.
+    """
+    helper = os.getenv("AGENT_WORKTREE_BIN", str(ROOT / "bin/agent-worktree"))
+    p = subprocess.run([helper, "radar", str(worktree), "--session", session, "--remote", remote, "--json"],
+                       capture_output=True, text=True, env=clean_env())
+    if p.returncode != 0:
+        # The session may not be registered, for example in a checkout that is
+        # not a managed worktree. The current branch is then the subject of
+        # the comparison.
+        p = subprocess.run([helper, "radar", str(worktree), "--remote", remote, "--json"],
+                           capture_output=True, text=True, env=clean_env())
+    if p.returncode != 0:
+        return None
+    try:
+        result = json.loads(p.stdout)
+    except ValueError:
+        return None
+    if not isinstance(result, dict):
+        return None
+    collisions = result.get("collisions") or []
+    if not collisions:
+        return None
+    trace.emit("collision-radar", status=result.get("status"), collisions=collisions)
+    for row in collisions:
+        paths = ", ".join(f"{p.get('type')}:{p.get('path')}" for p in row.get("paths", []))
+        print("agent-push: collision detected with " + str(row.get("target"))
+              + ((": " + paths) if paths else ""), file=sys.stderr)
+    print("agent-push: the publication proceeds; coordinate before merging the pull request",
+          file=sys.stderr)
+    return result
 
 
 def wrapper(args):
@@ -453,6 +524,12 @@ def wrapper(args):
             json.dump(token, f)
         env = clean_env()
         env.update(AGENT_ACTOR=actor, AGENT_SESSION=session, AGENT_PUSH_AUTH=str(token_path))
+        # The radar is informative: it tells which files will collide before
+        # the merge, and it never refuses the publication.
+        try:
+            radar_notice(worktree, common, repo_id, actor, session, trace, updates, remote=opt.remote)
+        except (OSError, ValueError):
+            pass
         leases = ["--force-with-lease=" + u["ref"] + ":" + ("" if zero(u["old"]) else u["old"]) for u in updates]
         p = subprocess.run(["git", "push", "--atomic", "--porcelain", *leases, opt.remote, *refspecs], env=env,
                            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)

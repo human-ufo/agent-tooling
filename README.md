@@ -35,6 +35,12 @@ agent-worktree open /ruta/al/repo --agent codex --session tarea-123 --branch age
 agent-worktree identity /ruta/al/worktree --json
 cd /ruta/al/worktree
 
+# Radar de colisiones: qué archivos de esta sesión chocan con otra sesión
+# activa o con la rama por defecto del remoto. Solo lee y simula merges en
+# memoria, no toca ningún árbol de trabajo.
+agent-worktree radar /ruta/al/repo --session tarea-123 --json
+agent-worktree radar /ruta/al/repo            # usa la rama del checkout actual
+
 # Dentro del worktree gestionado se infieren actor/sesión.
 agent-push origin HEAD:refs/heads/agent/tarea-123
 # En un checkout sin registro, ambos valores son obligatorios:
@@ -226,6 +232,29 @@ solo elimina una rama si un ref remoto recién consultado conserva su commit
 exacto. Un squash merge no acredita esa preservación: se conserva la rama.
 `reconcile` inspecciona registros y locks sin borrar trabajo; el estado legado
 se migra explícitamente mediante `migrate` con identidad y motivo.
+
+`close` libera además el lock que la propia sesión tenía sobre esa rama, y lo
+registra como `lock-release` en la auditoría de locks. Un lock de otro actor o
+de otra sesión nunca se toca, ni siquiera cuando está vencido. Si el directorio
+del worktree ya no existe porque se lo borró por fuera de la herramienta, el
+cierre solo se completa cuando la rama local sigue presente o cuando su commit
+se demuestra preservado en el remoto; con `--prune` se exige además que el
+commit viva en una cabeza remota.
+
+`agent-worktree radar` simula fusiones de tres vías con `git merge-tree
+--write-tree`, que no toca el índice ni el árbol de trabajo, y devuelve qué
+archivos de la sesión chocan con los de otra sesión activa o con la rama por
+defecto del remoto. Distingue `content`, `add/add` y `modify/delete`, que son
+las colisiones de la capa textual; las de compilación y las semánticas no se
+detectan aquí. `agent-push` lo invoca antes de publicar y emite un aviso
+informativo: la publicación no se bloquea, porque publicar la rama es lo que
+resguarda el trabajo en el remoto.
+
+Los verificadores de un mismo repositorio se ejecutan en serie, con una cola
+FIFO por repositorio, para que dos sesiones que publican al mismo tiempo no
+compitan por CPU y disco y produzcan timeouts falsos. El evento `verification`
+registra `queue_wait_ms` y `run_duration_ms` para poder distinguir una
+ejecución lenta de una espera larga.
 
 Los eventos JSONL están en `~/.cache/agent-changesets/<repo_id>.jsonl` (o
 `AGENT_CHANGESET_DIR`). Incluyen versión de esquema, host, repositorio, actor,
