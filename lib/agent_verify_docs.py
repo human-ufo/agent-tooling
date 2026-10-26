@@ -28,6 +28,7 @@ import importlib.machinery
 import importlib.util
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -252,6 +253,30 @@ def changed_markdown(repo, commit):
     return changed, added
 
 
+CONFLICT_MARKER_RE = re.compile(r"^(?:<{7}(?: .*)?|={7}|>{7}(?: .*)?)$")
+
+
+def conflict_marker_errors(path):
+    """Marcadores de conflicto de Git sin resolver en un documento.
+
+    Una fusión por squash que resuelve el conflicto en el editor puede dejar
+    las lineas `<<<<<<<`, `=======` y `>>>>>>>` dentro del texto publicado.
+    El linter de documentación no las ve, y los indices que el linter excluye
+    (`README.md`, `AI_KNOWLEDGE_MAP.md`, `AGENDA.md`) son los que mas se tocan
+    en paralelo, asi que la guarda va antes de cualquier exclusion.
+    """
+    errors = []
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return errors
+    for number, line in enumerate(text.splitlines(), 1):
+        if CONFLICT_MARKER_RE.match(line):
+            errors.append("línea %d: marcador de conflicto de Git sin resolver (%s)"
+                          % (number, line[:7]))
+    return errors
+
+
 def review(profile, repo, changed, added):
     """Revisa los documentos y devuelve el número de errores bloqueantes."""
     seen_ids = profile.seen_ids_outside(repo, changed)
@@ -261,18 +286,29 @@ def review(profile, repo, changed, added):
         if not path.is_file():
             print("SKIP  " + name + " (no está en el checkout)")
             continue
+        marker_errors = conflict_marker_errors(path)
         if profile.skip(name):
-            print("SKIP  " + name + " (excluido por el linter)")
+            # Un indice que el linter excluye igual se publica: si trae
+            # marcadores de conflicto, el error bloquea igual.
+            if marker_errors:
+                print("FAIL  " + name + " (marcadores de conflicto)")
+                for message in marker_errors:
+                    print("  error: " + message)
+                failures += len(marker_errors)
+            else:
+                print("SKIP  " + name + " (excluido por el linter)")
             continue
         errors, warnings = profile.check(name, seen_ids)
-        errors = list(errors or [])
+        marker_set = set(marker_errors)
+        errors = list(marker_errors) + [error for error in (errors or []) if error not in marker_set]
         warnings = list(warnings or [])
         is_new = name in added
         if is_new:
             blocking, notices = errors, warnings
         else:
-            blocking = [error for error in errors if profile.critical(error)]
-            notices = [error for error in errors if not profile.critical(error)] + warnings
+            blocking = list(marker_errors) + [error for error in errors
+                                             if error not in marker_set and profile.critical(error)]
+            notices = [error for error in errors if error not in blocking] + warnings
         if not errors and not warnings:
             print("OK    " + name)
             continue

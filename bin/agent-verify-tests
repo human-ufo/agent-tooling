@@ -52,6 +52,34 @@ if [[ ! -d "$suite" ]]; then
   exit 1
 fi
 
+# Un conflicto de Git sin resolver no puede quedar publicado. Una fusion por
+# squash que resuelve el conflicto en el editor deja las lineas `<<<<<<<`,
+# `=======` y `>>>>>>>` dentro del texto, y ningun test las detecta.
+python3 - "$resolved" <<'PY'
+import pathlib, re, subprocess, sys
+
+commit = sys.argv[1]
+out = subprocess.check_output(
+    ["git", "diff-tree", "--root", "-m", "--first-parent", "--no-commit-id",
+     "--name-only", "-r", "-z", "--no-renames", "--diff-filter=AM", commit],
+    text=True)
+marker = re.compile(r"^(?:<{7}(?: .*)?|={7}|>{7}(?: .*)?)$")
+bad = []
+for name in out.split("\0"):
+    if not name or not name.endswith(".md"):
+        continue
+    path = pathlib.Path(name)
+    if not path.is_file():
+        continue
+    for lineno, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+        if marker.match(line):
+            bad.append("%s:%d: unresolved Git conflict marker (%s)" % (name, lineno, line[:7]))
+if bad:
+    for item in bad:
+        print(item, file=sys.stderr)
+    sys.exit(1)
+PY
+
 output="$(python3 -m unittest discover -s "$suite" -p "$pattern" 2>&1)"
 status=$?
 printf '%s\n' "$output"
