@@ -123,9 +123,10 @@ def atomic_json(path, payload):
             os.unlink(tmp)
 
 
-def audit(root, event, args, repo, previous=None):
+def audit(root, event, args, repo, previous=None, reason=None):
     entry = {'time': iso(), 'event': event, 'repo_id': repo['repo_id'],
-             'actor': args.agent, 'session': args.session, 'reason': args.reason,
+             'actor': args.agent, 'session': args.session,
+             'reason': reason if reason is not None else args.reason,
              'previous': previous}
     with (root / f"{repo['repo_id']}.audit.jsonl").open('a') as stream:
         stream.write(json.dumps(entry, sort_keys=True) + '\n')
@@ -189,6 +190,9 @@ def validate_record(record, repo):
         raise Failure('invalid session lifecycle state')
     if record.get('lifecycle') == 'closing' and not re.fullmatch(r'[a-f0-9]{40,64}', record.get('close_oid', '')):
         raise Failure('malformed closing session commit')
+    if 'previous_branches' in record:
+        if not isinstance(record['previous_branches'], list) or not all(isinstance(b, str) and b for b in record['previous_branches']):
+            raise Failure('malformed session previous_branches')
     return record
 
 
@@ -226,10 +230,72 @@ def find_session(records, args, repo):
     return rec
 
 
+def migrate_own_lock_branch(repo, old_branch, new_branch, agent, session):
+    """Move a lock owned by this session when the session renames its branch.
+
+    The lock names one branch. When the session renames the branch inside its
+    worktree, the lock of the old name would stay behind and block the next
+    session on that branch, so the lock travels with the session.
+    """
+    if not old_branch or not new_branch or old_branch == new_branch:
+        return None
+    lock_root = directory('locks')
+    with serialized(lock_root, repo['repo_id']):
+        old_file = lock_path(lock_root, repo, old_branch)
+        new_file = lock_path(lock_root, repo, new_branch)
+        if not old_file.exists() or new_file.exists():
+            return None
+        try:
+            data = read_json(old_file)
+        except Failure:
+            return None
+        if not isinstance(data, dict) or data.get('agent') != agent or data.get('session') != session:
+            return None
+        atomic_json(new_file, dict(data, branch=new_branch, updated_at=iso()))
+        old_file.unlink(missing_ok=True)
+        return {'from': old_branch, 'to': new_branch}
+
+
+def sync_session_branch(file, root, repo, records, rec, actual, args):
+    """Adopt a named branch checked out inside a managed worktree.
+
+    Agents often open a worktree with the default branch name and then create
+    or rename a Conventional Commits branch (feat/*, fix/*, docs/*) inside the
+    worktree. Updating the session record and migrating its lock keeps the
+    managed identity intact, while a detached HEAD or a branch that belongs to
+    another session is still refused.
+    """
+    actual_ref = (actual or {}).get('branch') or ''
+    if not actual_ref.startswith('refs/heads/'):
+        return False
+    new_branch = actual_ref[len('refs/heads/'):]
+    if new_branch == rec['branch']:
+        return True
+    branch_name(repo['repo'], new_branch)
+    if any(r['session'] != rec['session'] and r.get('branch') == new_branch for r in records):
+        return False
+    old_branch = rec['branch']
+    previous = list(rec.get('previous_branches', []))
+    if old_branch not in previous:
+        previous.append(old_branch)
+    rec['branch'] = new_branch
+    rec['previous_branches'] = previous
+    save_registry(file, repo, records)
+    lock_moved = migrate_own_lock_branch(repo, old_branch, new_branch, rec['agent'], rec['session'])
+    audit_args = argparse.Namespace(**vars(args))
+    audit_args.agent = rec['agent']
+    audit_args.session = rec['session']
+    audit(root, 'worktree-branch-sync', audit_args, repo,
+          {'old_branch': old_branch, 'new_branch': new_branch, 'worktree': rec['path'],
+           'lock_moved': lock_moved},
+          reason='session branch updated to match the checked-out branch')
+    return True
+
+
 def identity(args, repo):
     root = directory('worktrees')
     with serialized(root, repo['repo_id']):
-        _, records = registry(root, repo)
+        file, records = registry(root, repo)
         top = os.path.realpath(git(repo['repo'], 'rev-parse', '--show-toplevel').stdout.strip())
         current = next((r for r in records if os.path.realpath(r['path']) == top), None)
         if current:
@@ -250,7 +316,8 @@ def identity(args, repo):
         if not actual or not Path(rec['path']).is_dir():
             raise Failure('registered session worktree is missing; run reconcile; record retained')
         if actual.get('branch') != f"refs/heads/{rec['branch']}":
-            raise Failure('registered session branch changed; run reconcile; record retained')
+            if not sync_session_branch(file, root, repo, records, rec, actual, args):
+                raise Failure('registered session branch changed; run reconcile; record retained')
         return dict(rec, actor=rec['agent'], worktree=rec['path'])
 
 
@@ -315,7 +382,7 @@ def lock_path(root, repo, branch):
     return root / f"{repo['repo_id']}.{digest(branch)}.lock"
 
 
-def release_own_lock(root, repo, branch, agent, session, args, reason):
+def release_own_lock(root, repo, branch, agent, session, args, reason, previous_branches=None):
     """Release the lock of this branch when this session owns it.
 
     A session that ends its worktree must not leave its branch locked, because
@@ -323,7 +390,27 @@ def release_own_lock(root, repo, branch, agent, session, args, reason):
     the lock of the same actor and session is touched; an expired lock of this
     session is released too, because the owner is exactly the one that is
     closing. A lock of another actor is never removed, not even when expired.
+
+    The branch names the session held before a rename are released as well, so
+    a renamed session does not leave a lock behind on the name it abandoned.
     """
+    audit_args = argparse.Namespace(**vars(args))
+    audit_args.agent = agent
+    audit_args.session = session
+    for previous_branch in (previous_branches or ()):
+        if not previous_branch or previous_branch == branch:
+            continue
+        previous_file = lock_path(root, repo, previous_branch)
+        if not previous_file.exists():
+            continue
+        try:
+            previous_data = read_json(previous_file)
+        except Failure:
+            continue
+        if isinstance(previous_data, dict) and previous_data.get('agent') == agent \
+                and previous_data.get('session') == session:
+            audit(root, 'lock-release', audit_args, repo, previous_data, reason=args.reason or reason)
+            previous_file.unlink(missing_ok=True)
     file = lock_path(root, repo, branch)
     if not file.exists():
         return None
@@ -336,7 +423,7 @@ def release_own_lock(root, repo, branch, agent, session, args, reason):
     if data.get('agent') != agent or data.get('session') != session:
         return {'status': 'foreign', 'branch': branch,
                 'owner': {'agent': data.get('agent'), 'session': data.get('session')}}
-    audit(root, 'lock-release', args, repo, data)
+    audit(root, 'lock-release', audit_args, repo, data, reason=args.reason or reason)
     file.unlink(missing_ok=True)
     return {'status': 'released', 'branch': branch, 'expired': data.get('expires_epoch', 0) <= time.time()}
 
@@ -422,8 +509,71 @@ def detect_collisions(repo, source_oid, source_label, targets, exclude_branch=No
             'status': 'conflict' if collisions else 'clean'}
 
 
-def active_branches(repo, records, exclude_session=None):
-    """Branches of the sessions that are currently open, with their tip."""
+INDEX_BASENAMES = ('AI_KNOWLEDGE_MAP.md', 'README.md', 'AGENDA.md')
+
+
+def is_branch_integrated(repo, oid, default_oid, base_oid=None):
+    """Say whether a session branch carries no work that is still unmerged.
+
+    After a pull request is squash-merged on GitHub and the session forgets to
+    run `agent-worktree close`, the local branch stays in the registry with its
+    pre-squash commit. Keeping it in the radar then reports a false conflict
+    against every later session, because the shared index files differ between
+    the old branch tip and the squashed main.
+
+    Four proofs are accepted, from the strongest to the weakest:
+    the tip is the base the session started from, the tip is an ancestor of the
+    default branch, every commit of the branch is already in the default
+    branch according to `git cherry`, or every substantive file of the branch
+    has the very same blob in the default branch, which is what a squash merge
+    produces. Only the index files are excluded from that last proof, because
+    every session regenerates them and they never carry unique work.
+    """
+    if not oid or not re.fullmatch(r'[a-f0-9]{40,64}', oid):
+        return False
+    if base_oid and oid == base_oid:
+        return True
+    if not default_oid or not re.fullmatch(r'[a-f0-9]{40,64}', default_oid):
+        return False
+    if git(repo['repo'], 'merge-base', '--is-ancestor', oid, default_oid, check=False).returncode == 0:
+        return True
+    merge_base = git(repo['repo'], 'merge-base', default_oid, oid, check=False)
+    if merge_base.returncode != 0:
+        return False
+    base = merge_base.stdout.strip()
+    # The default branch has to have moved past the merge base, otherwise the
+    # branch cannot have been merged into it yet.
+    if not base or base == default_oid:
+        return False
+    cherry = git(repo['repo'], 'cherry', default_oid, oid, check=False)
+    if cherry.returncode == 0:
+        lines = [line.strip() for line in cherry.stdout.splitlines() if line.strip()]
+        if lines and all(line.startswith('- ') for line in lines):
+            return True
+    changed = git(repo['repo'], 'diff', '--name-only', f'{base}..{oid}', check=False)
+    if changed.returncode != 0:
+        return False
+    files = [line.strip() for line in changed.stdout.splitlines() if line.strip()]
+    substantive = [name for name in files if os.path.basename(name) not in INDEX_BASENAMES]
+    if not substantive:
+        return False
+    for name in substantive:
+        branch_blob = git(repo['repo'], 'rev-parse', '--verify', '--quiet', f'{oid}:{name}', check=False)
+        default_blob = git(repo['repo'], 'rev-parse', '--verify', '--quiet', f'{default_oid}:{name}', check=False)
+        if branch_blob.returncode != 0 or default_blob.returncode != 0:
+            return False
+        if branch_blob.stdout.strip() != default_blob.stdout.strip():
+            return False
+    return True
+
+
+def active_branches(repo, records, exclude_session=None, default_oid=None):
+    """Branches of the sessions that are currently open, with their tip.
+
+    A session whose branch is already integrated in the default branch is left
+    out: its pull request was merged and only the forgotten close keeps it in
+    the registry.
+    """
     rows = []
     for rec in records:
         if rec.get('lifecycle', 'active') != 'active':
@@ -434,8 +584,11 @@ def active_branches(repo, records, exclude_session=None):
         oid = git(repo['repo'], 'rev-parse', '--verify', ref, check=False)
         if oid.returncode:
             continue
+        tip = oid.stdout.strip()
+        if default_oid and is_branch_integrated(repo, tip, default_oid, rec.get('base_oid')):
+            continue
         rows.append({'session': rec['session'], 'agent': rec['agent'], 'branch': rec['branch'],
-                     'oid': oid.stdout.strip()})
+                     'oid': tip})
     return rows
 
 
@@ -496,12 +649,12 @@ def radar(args, repo):
     default_ref, default_oid = default_branch_oid(repo, args.remote)
     if default_ref and default_oid:
         targets.append((default_ref, default_oid))
-    for row in active_branches(repo, records, exclude_session=source['session']):
+    for row in active_branches(repo, records, exclude_session=source['session'], default_oid=default_oid):
         targets.append((row['branch'], row['oid']))
     result = detect_collisions(repo, source['oid'], source['branch'], targets)
     result['repo_id'] = repo['repo_id']
     result['source'] = source
-    result['sessions'] = active_branches(repo, records)
+    result['sessions'] = active_branches(repo, records, default_oid=default_oid)
     report(args, result)
     return 0
 
@@ -572,6 +725,77 @@ def worktree_command(args):
         if args.command == 'list':
             report(args, {'repo_id': repo['repo_id'], 'sessions': records, 'git_worktrees': registered_worktrees(repo)})
             return 0
+        if args.command == 'gc':
+            # The collector closes the sessions whose work is already in the
+            # default branch. A session that merged its pull request and
+            # forgot to close its worktree keeps its branch in the registry
+            # and makes every later radar report a false conflict.
+            git(repo['repo'], 'fetch', '--quiet', args.remote, check=False)
+            _, default_oid = default_branch_oid(repo, args.remote)
+            actual_map = {r['worktree']: r for r in registered_worktrees(repo)}
+            lock_root = directory('locks')
+            cleaned, kept = [], []
+            for rec in list(records):
+                if rec.get('lifecycle') != 'active':
+                    kept.append(rec)
+                    continue
+                path = Path(rec['path'])
+                actual = actual_map.get(os.path.realpath(path))
+                if actual and path.is_dir() and actual.get('branch') != f"refs/heads/{rec['branch']}":
+                    sync_session_branch(file, root, repo, records, rec, actual, args)
+                lfile = lock_path(lock_root, repo, rec['branch'])
+                if lfile.exists():
+                    try:
+                        ldata = read_json(lfile)
+                    except Failure:
+                        ldata = None
+                    if not isinstance(ldata, dict):
+                        # A lock that cannot be read is never removed blindly.
+                        kept.append(rec)
+                        continue
+                    if ldata.get('agent') != rec['agent'] or ldata.get('session') != rec['session']:
+                        # Another session holds the branch: it may still be
+                        # working on it, so this one is left alone.
+                        kept.append(rec)
+                        continue
+                ref = f"refs/heads/{rec['branch']}"
+                branch_oid = git(repo['repo'], 'rev-parse', '--verify', ref, check=False).stdout.strip()
+                if not branch_oid:
+                    kept.append(rec)
+                    continue
+                if not is_branch_integrated(repo, branch_oid, default_oid, rec.get('base_oid')):
+                    kept.append(rec)
+                    continue
+                if actual and path.is_dir():
+                    dirty = git(path, 'status', '--porcelain', '--untracked-files=all', '--ignored=matching', check=False).stdout
+                    if dirty:
+                        kept.append(rec)
+                        continue
+                    try:
+                        git(repo['repo'], 'worktree', 'remove', str(path))
+                    except Failure:
+                        kept.append(rec)
+                        continue
+                elif path.exists():
+                    kept.append(rec)
+                    continue
+                released = release_own_lock(lock_root, repo, rec['branch'], rec['agent'], rec['session'], args,
+                                            'auto-released on worktree gc (branch integrated)',
+                                            previous_branches=rec.get('previous_branches'))
+                gc_args = argparse.Namespace(**vars(args))
+                gc_args.agent = rec['agent']
+                gc_args.session = rec['session']
+                audit(root, 'worktree-close', gc_args, repo,
+                      {'branch': rec['branch'], 'branch_oid': branch_oid, 'branch_pruned': False,
+                       'worktree': str(path), 'gc': True},
+                      reason=args.reason or 'auto-closed by gc: the branch is integrated and the worktree is clean')
+                cleaned.append({'session': rec['session'], 'agent': rec['agent'], 'branch': rec['branch'],
+                                'commit': branch_oid, 'lock': released})
+            if cleaned:
+                save_registry(file, repo, kept)
+            report(args, {'repo_id': repo['repo_id'], 'cleaned': cleaned, 'remaining': len(kept),
+                          'message': f'gc closed {len(cleaned)} integrated session(s); {len(kept)} remaining'})
+            return 0
         if args.command == 'open':
             safe_name(args.agent, 'actor')
             args.session = args.session or f'{args.agent}-{uuid.uuid4().hex}'
@@ -632,9 +856,13 @@ def worktree_command(args):
             if not preserved:
                 raise Failure('interrupted close commit preservation unproven; registry retained; inspect manually')
             save_registry(file, repo, [r for r in records if r['session'] != rec['session']])
-            released = release_own_lock(directory('locks'), repo, rec['branch'], rec['agent'], rec['session'], args, 'auto-released on interrupted close')
+            released = release_own_lock(directory('locks'), repo, rec['branch'], rec['agent'], rec['session'], args, 'auto-released on interrupted close', previous_branches=rec.get('previous_branches'))
             report(args, {'message': f'interrupted close completed for {rec["session"]}; commit preserved', 'repo_id': repo['repo_id'], 'branch': rec['branch'], 'branch_retained': current.returncode == 0, 'lock': released})
             return 0
+        if actual and path.is_dir() and actual.get('branch') != f"refs/heads/{rec['branch']}":
+            # The session renamed its branch inside the worktree. The record
+            # follows the checked-out branch, and the lock travels with it.
+            sync_session_branch(file, root, repo, records, rec, actual, args)
         if not actual or not path.is_dir() or actual.get('branch') != f"refs/heads/{rec['branch']}":
             # The worktree directory can disappear without this tool removing
             # it, for example with a direct `git worktree remove`. The record
@@ -655,7 +883,7 @@ def worktree_command(args):
                 save_registry(file, repo, [r for r in records if r['session'] != rec['session']])
                 if args.prune:
                     git(repo['repo'], 'update-ref', '-d', branch_ref, oid)
-                released = release_own_lock(directory('locks'), repo, rec['branch'], rec['agent'], rec['session'], args, 'auto-released on close of a vanished worktree')
+                released = release_own_lock(directory('locks'), repo, rec['branch'], rec['agent'], rec['session'], args, 'auto-released on close of a vanished worktree', previous_branches=rec.get('previous_branches'))
                 audit(root, 'worktree-close', args, repo, {'branch': rec['branch'], 'branch_oid': oid,
                                                             'branch_pruned': bool(args.prune), 'worktree': str(path),
                                                             'worktree_absent': True, 'preservation': proof})
@@ -695,7 +923,7 @@ def worktree_command(args):
                                                    'branch_pruned': bool(args.prune), 'worktree': str(path)})
         # The session is over, so its own lock on that branch is released here.
         # A lock of another actor is left untouched.
-        released = release_own_lock(directory('locks'), repo, rec['branch'], rec['agent'], rec['session'], args, 'auto-released on worktree close')
+        released = release_own_lock(directory('locks'), repo, rec['branch'], rec['agent'], rec['session'], args, 'auto-released on worktree close', previous_branches=rec.get('previous_branches'))
         report(args, {'message': f'session {rec["session"]} closed; branch {rec["branch"]} ' + ('pruned' if args.prune else 'retained'), 'branch': rec['branch'], 'branch_retained': not args.prune, 'repo_id': repo['repo_id'], 'lock': released})
         return 0
 
@@ -802,7 +1030,7 @@ def main(tool=None):
         tool = sys.argv.pop(1)
     tool = tool or Path(sys.argv[0]).name
     parser = argparse.ArgumentParser(description=__doc__)
-    commands = ('open', 'close', 'path', 'identity', 'list', 'reconcile', 'migrate', 'radar') if tool == 'agent-worktree' else ('acquire', 'check', 'renew', 'release', 'recover', 'list', 'reconcile', 'migrate')
+    commands = ('open', 'close', 'path', 'identity', 'list', 'reconcile', 'migrate', 'radar', 'gc') if tool == 'agent-worktree' else ('acquire', 'check', 'renew', 'release', 'recover', 'list', 'reconcile', 'migrate')
     parser.add_argument('command', choices=commands, nargs='?', default='list')
     parser.add_argument('repo', nargs='?', default=None)
     parser.add_argument('--agent', default=os.environ.get('AGENT_ACTOR', os.environ.get('AGENT_NAME', getpass.getuser())))

@@ -414,7 +414,12 @@ def radar_notice(worktree, common, repo_id, actor, session, trace, updates, remo
     the work in the remote, and refusing to publish would leave it only on the
     local disk. It exists so the agent or the person knows before merging the
     pull request which files will collide and with which session.
+
+    The remote is fetched first, because a radar that compares against a stale
+    `origin/main` reports collisions that were resolved long ago and stays
+    blind to the work another machine published in the meantime.
     """
+    git("fetch", "--quiet", remote, cwd=worktree, check=False)
     helper = os.getenv("AGENT_WORKTREE_BIN", str(ROOT / "bin/agent-worktree"))
     p = subprocess.run([helper, "radar", str(worktree), "--session", session, "--remote", remote, "--json"],
                        capture_output=True, text=True, env=clean_env())
