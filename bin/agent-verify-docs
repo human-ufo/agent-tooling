@@ -10,7 +10,7 @@
 # existe.
 #
 # El linter de documentación vive fuera del repositorio verificado, en
-# ~/.agents/skills/docs-writer/lint_docs.py, y se puede sobreescribir con
+# ~/.agents/skills/documentar/lint_docs.py, y se puede sobreescribir con
 # DOCS_LINT o con --lint. Para `agent-tasks` el perfil `tasks` usa el linter
 # del propio repositorio (scripts/lint_tasks.py).
 set -Eeuo pipefail

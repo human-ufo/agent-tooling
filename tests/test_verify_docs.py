@@ -1,7 +1,7 @@
 """Verificador de publicación para repos de gobernanza documental.
 
 Las pruebas usan un linter de fixture que replica el contrato de
-`~/.agents/skills/docs-writer/lint_docs.py` (`lint`, `is_critical`,
+`~/.agents/skills/documentar/lint_docs.py` (`lint`, `is_critical`,
 `should_skip`) sin depender del filesystem del usuario. El linter real se
 prueba aparte, y solo si está instalado.
 """
@@ -16,7 +16,7 @@ VERIFIER = ROOT / "bin/agent-verify-docs"
 # Fixture del linter de documentación. Replica el contrato del linter real:
 # `lint` devuelve (errores, avisos), `is_critical` decide qué errores bloquean
 # en un documento previo modificado y `should_skip` excluye los índices.
-FIXTURE_LINT = '''"""Linter de fixture: replica el contrato del linter de docs-writer."""
+FIXTURE_LINT = '''"""Linter de fixture: replica el contrato del linter de documentación."""
 import os
 import re
 
@@ -85,7 +85,7 @@ class VerifyDocsTests(PublishFixture):
         # El verificador corre en un checkout descartable, así que el linter
         # tiene que vivir fuera del repositorio verificado: el HOME del
         # fixture es el único sitio que el hook deja pasar al verificador.
-        lint_dir = self.home / ".agents/skills/docs-writer"
+        lint_dir = self.home / ".agents/skills/documentar"
         lint_dir.mkdir(parents=True)
         (lint_dir / "lint_docs.py").write_text(FIXTURE_LINT, encoding="utf-8")
         self.git("config", "agent.pushVerifyMode", "required")
@@ -173,7 +173,7 @@ class VerifyDocsTests(PublishFixture):
         lint.write_text(FIXTURE_LINT, encoding="utf-8")
         # El linter por defecto (dentro del HOME del fixture) no encuentra el
         # documento; el de la variable sí lo hace.
-        (self.home / ".agents/skills/docs-writer/lint_docs.py").write_text(
+        (self.home / ".agents/skills/documentar/lint_docs.py").write_text(
             "#!/usr/bin/env python3\n"
             "def lint(path):\n"
             "    return ['error de siempre'], []\n"
@@ -208,7 +208,7 @@ class VerifyDocsTests(PublishFixture):
         self.assertEqual(self.remote_sha(), self.first)
 
     def test_missing_linter_fails_with_an_actionable_message(self):
-        lint_dir = self.home / ".agents/skills/docs-writer"
+        lint_dir = self.home / ".agents/skills/documentar"
         (lint_dir / "lint_docs.py").unlink()
         self.write_doc("2026-10-23_Documento_Valido.md", VALID_DOC)
         p = self.push("origin", "HEAD:refs/heads/topic", check=False)
@@ -217,6 +217,38 @@ class VerifyDocsTests(PublishFixture):
         # Un mensaje accionable, no una excepción sin contexto.
         self.assertNotIn("Traceback", p.stderr)
         self.assertIn("no se encontró el linter", p.stderr)
+
+    def test_retired_skill_path_still_works_as_a_fallback(self):
+        # The documentation skill was renamed. An installation that has not
+        # been updated yet still has the retired path, and the push must not
+        # lose its barrier because of that.
+        retired = self.home / ".agents/skills/docs-writer"
+        retired.mkdir(parents=True)
+        (retired / "lint_docs.py").write_text(FIXTURE_LINT, encoding="utf-8")
+        (self.home / ".agents/skills/documentar/lint_docs.py").unlink()
+        self.write_doc("2026-10-23_Documento_Valido.md", VALID_DOC)
+        p = self.push("origin", "HEAD:refs/heads/topic", check=False)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.remote_sha(), self.git("rev-parse", "HEAD").stdout.strip())
+
+    def test_the_current_skill_path_wins_over_the_retired_one(self):
+        # When both are present the current one is the one that decides. The
+        # current path carries the linter that rejects, the retired one the
+        # linter that accepts: if the retired path won, the push would pass.
+        retired = self.home / ".agents/skills/docs-writer"
+        retired.mkdir(parents=True)
+        (retired / "lint_docs.py").write_text(FIXTURE_LINT, encoding="utf-8")
+        (self.home / ".agents/skills/documentar/lint_docs.py").write_text(
+            "#!/usr/bin/env python3\n"
+            "def lint(path):\n"
+            "    return ['error de siempre'], []\n"
+            "def is_critical(message):\n"
+            "    return True\n",
+            encoding="utf-8")
+        self.write_doc("2026-10-23_Documento_Valido.md", VALID_DOC)
+        p = self.push("origin", "HEAD:refs/heads/topic", check=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(self.remote_sha(), self.first)
 
     def test_tasks_profile_uses_the_linter_inside_the_repository(self):
         # El perfil de tareas usa el linter que vive en el repositorio
@@ -249,8 +281,8 @@ class VerifyDocsTests(PublishFixture):
         self.assertEqual(self.remote_sha(), self.first)
 
 
-@unittest.skipUnless(Path(os.environ.get("HOME", ""), ".agents/skills/docs-writer/lint_docs.py").is_file(),
-                     "el linter de docs-writer no está instalado")
+@unittest.skipUnless(Path(os.environ.get("HOME", ""), ".agents/skills/documentar/lint_docs.py").is_file(),
+                     "el linter de documentación no está instalado")
 class RealLinterTests(PublishFixture):
     """Comprueba el helper contra el linter real, si está instalado."""
 

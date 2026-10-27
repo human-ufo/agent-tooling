@@ -139,17 +139,17 @@ Configuración:
 | --- | --- | --- |
 | Ruta del verificador | `agent.pushVerify` | ninguna: hay que declararla, y **absoluta** |
 | Modo | `agent.pushVerifyMode` | ninguna: hay que declararlo (`optional` o `required`) |
-| Ruta del linter de documentación | `DOCS_LINT` | `~/.agents/skills/docs-writer/lint_docs.py` |
+| Ruta del linter de documentación | `DOCS_LINT` | `~/.agents/skills/documentar/lint_docs.py` |
 | Perfil del linter | `--profile` o `DOCS_LINT_PROFILE` | `docs` |
 | Linter de tareas | `--profile tasks` | `<repo>/scripts/lint_tasks.py` (dentro del repositorio) |
 
-El valor por defecto del linter es `~/.agents/skills/docs-writer/lint_docs.py`:
+El valor por defecto del linter es `~/.agents/skills/documentar/lint_docs.py`:
 es el mismo archivo que usa el `pre-commit` de los repos de documentación, así
 que el hook y el verificador aplican las mismas reglas. El linter **no** se
 modifica ni se copia a este repositorio: vive fuera, en el filesystem del
 usuario, y el helper lo carga por ruta absoluta. Si no está, el verificador
 falla con un mensaje accionable (no se encontró el linter en …; instalá el
-skill docs-writer o configurá la ruta), nunca con una excepción sin contexto.
+skill documentar o configurá la ruta), nunca con una excepción sin contexto.
 
 `DOCS_LINT` y `DOCS_LINT_PROFILE` no llegan al verificador por sí solas: el
 hook filtra el entorno y solo deja pasar las variables declaradas en
@@ -204,7 +204,7 @@ documentos previos modificados, que es la misma regla que su `pre-commit`.
 árbol de trabajo. No puede juzgar si un cambio sin commitear está bien, ni
 detectar un archivo roto que todavía no está en ningún commit. Solo publica
 correctamente lo que ya está commiteado. Además, el helper no modifica el
-linter: si las reglas cambian, hay que actualizar el skill docs-writer y
+linter: si las reglas cambian, hay que actualizar el skill documentar y
 reinstalarlo, no el repositorio de tooling.
 
 Un tag anotado anuncia el **objeto tag**, no el commit. El checkout se hace del
@@ -296,7 +296,7 @@ aislar el estado deben fijar las tres variables.
 
 El instalador respeta `core.hooksPath`, también relativo a un linked worktree.
 Encadena hooks ejecutables anteriores con el mismo stdin y conserva el lint
-pre-commit de docs-writer. No encadena la antigua barrera gestionada al migrarla.
+pre-commit del skill documentar. No encadena la antigua barrera gestionada al migrarla.
 Reinstalar valida los dispatchers antes de cambiar nada; los runtimes tienen
 hash de contenido e identidad inmutable. Cada hooksPath conserva un
 `agent-tooling-manifest.json` con runtime, hash de fuente, hooks y backups.

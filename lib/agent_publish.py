@@ -641,7 +641,7 @@ def dispatcher(commands):
 
 
 # Repositories whose documents follow the documentation standard. The lint of
-# the docs-writer skill is only meaningful there.
+# the `documentar` skill is only meaningful there.
 DOCUMENTATION_REPOSITORIES = ("personal-docs", "avla-docs-reporteria")
 
 
@@ -690,8 +690,17 @@ def install_one(repo, hooks):
     # rules demand sections that a task file or a source file does not have, so
     # installing it anywhere else blocks legitimate commits.
     if documentation_repository(repo):
-        lint = Path.home() / ".agents/skills/docs-writer/pre-commit"
-        if lint.is_file():
+        # The hook of the `documentar` skill, the single documentation entry
+        # point. The retired `docs-writer` path stays as a fallback so an
+        # installation that has not been updated yet keeps its barrier.
+        lint = None
+        for relative in (".agents/skills/documentar/pre-commit",
+                         ".agents/skills/docs-writer/pre-commit"):
+            candidate = Path.home() / relative
+            if candidate.is_file():
+                lint = candidate
+                break
+        if lint is not None:
             payload["hooks/pre-commit-docs-lint"] = lint.read_bytes()
         elif "pre-commit" in manifest["hooks"]:
             # Keep previously installed lint when source skill isn't available.
