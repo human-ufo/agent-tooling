@@ -41,6 +41,10 @@ cd /ruta/al/worktree
 agent-worktree radar /ruta/al/repo --session tarea-123 --json
 agent-worktree radar /ruta/al/repo            # usa la rama del checkout actual
 
+# Diagnóstico consolidado de solo lectura: 0 sano, 1 atención, 2 error de uso.
+agent-health --repo /ruta/al/repo --json
+agent-health --repos-file ~/.config/agent-tooling/health-repos --json
+
 # Dentro del worktree gestionado se infieren actor/sesión.
 agent-push origin HEAD:refs/heads/agent/tarea-123
 # En un checkout sin registro, ambos valores son obligatorios:
@@ -250,6 +254,20 @@ detectan aquí. `agent-push` lo invoca antes de publicar y emite un aviso
 informativo: la publicación no se bloquea, porque publicar la rama es lo que
 resguarda el trabajo en el remoto.
 
+Cada evaluación deja un evento `collision-radar`, también cuando está limpia.
+`status` distingue `clean`, `conflict` y `unknown`; `freshness` distingue
+`refreshed` de `stale`. Si falla la actualización remota, el estado efectivo es
+`unknown` y `comparison_status` conserva el diagnóstico parcial obtenido con
+las referencias locales. Una base ausente o un fallo del diagnóstico nunca se
+presentan como ausencia de conflictos. Estos avisos no bloquean la publicación.
+
+El colector `agent-worktree gc` requiere actualización remota correcta y un
+worktree limpio cuyo HEAD real coincida con la rama que se conserva. Un HEAD
+desacoplado, un error al consultar el estado o un directorio ausente conservan
+la sesión para revisión explícita. La integración por blobs excluye únicamente
+los índices regenerables de la raíz; un README anidado sigue siendo contenido
+sustantivo. `gc` elimina directorios: no es un modo de simulación.
+
 Los verificadores de un mismo repositorio se ejecutan en serie, con una cola
 FIFO por repositorio, para que dos sesiones que publican al mismo tiempo no
 compitan por CPU y disco y produzcan timeouts falsos. El evento `verification`
@@ -285,6 +303,25 @@ hash de contenido e identidad inmutable. Cada hooksPath conserva un
 Para rollback, detener nuevas publicaciones, restaurar cada `backup` en su
 nombre de hook (o quitar el dispatcher si `backup` es null) y retirar el
 manifest. Se conservan los runtimes anteriores para no romper procesos activos.
+
+## Diagnóstico periódico
+
+`agent-health` consolida sesiones activas inconsistentes, registros huérfanos,
+locks vencidos o malformados, integridad de los hooks y diferencias del runtime
+frente a la versión instalada. También cuenta publicaciones indeterminadas en
+las últimas 24 horas (`--since-hours` permite cambiar la ventana). Una
+confirmación posterior de la misma operación resuelve ese indicador; no se
+consulta la red ni se infiere el resultado histórico mirando una rama actual.
+El informe solo muestra códigos y contadores, sin reproducir logs crudos.
+No repara registros, no libera locks y no crea directorios de estado.
+
+Para ejecutarlo diariamente a las 09:00, instalar las unidades de `systemd/`
+en `~/.config/systemd/user/` y enlazar `bin/agent-health` en `~/.local/bin/`.
+Crear `~/.config/agent-tooling/health-repos` con una ruta absoluta por línea,
+y ejecutar `systemctl --user daemon-reload` seguido de
+`systemctl --user enable --now agent-health.timer`. El journal de
+`agent-health.service` conserva el informe. Una salida 1 requiere revisión;
+no equivale a un fallo de publicación ni autoriza una limpieza automática.
 
 ```bash
 python3 -m unittest discover -s tests -v

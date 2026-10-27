@@ -419,28 +419,63 @@ def radar_notice(worktree, common, repo_id, actor, session, trace, updates, remo
     `origin/main` reports collisions that were resolved long ago and stays
     blind to the work another machine published in the meantime.
     """
-    git("fetch", "--quiet", remote, cwd=worktree, check=False)
-    helper = os.getenv("AGENT_WORKTREE_BIN", str(ROOT / "bin/agent-worktree"))
-    p = subprocess.run([helper, "radar", str(worktree), "--session", session, "--remote", remote, "--json"],
-                       capture_output=True, text=True, env=clean_env())
-    if p.returncode != 0:
-        # The session may not be registered, for example in a checkout that is
-        # not a managed worktree. The current branch is then the subject of
-        # the comparison.
-        p = subprocess.run([helper, "radar", str(worktree), "--remote", remote, "--json"],
-                           capture_output=True, text=True, env=clean_env())
-    if p.returncode != 0:
-        return None
     try:
-        result = json.loads(p.stdout)
-    except ValueError:
-        return None
-    if not isinstance(result, dict):
-        return None
-    collisions = result.get("collisions") or []
+        fetch = git("fetch", "--quiet", remote, cwd=worktree, check=False)
+        freshness = "refreshed" if fetch.returncode == 0 else "stale"
+    except Exception:
+        freshness = "stale"
+    helper = os.getenv("AGENT_WORKTREE_BIN", str(ROOT / "bin/agent-worktree"))
+    result = None
+    diagnostic_available = False
+    try:
+        p = subprocess.run([helper, "radar", str(worktree), "--session", session, "--remote", remote, "--json"],
+                           capture_output=True, text=True, env=clean_env())
+        if p.returncode != 0:
+            # An unmanaged checkout or unknown session can still compare its current branch.
+            p = subprocess.run([helper, "radar", str(worktree), "--remote", remote, "--json"],
+                               capture_output=True, text=True, env=clean_env())
+        if p.returncode == 0:
+            decoded = json.loads(p.stdout)
+            if isinstance(decoded, dict):
+                result = decoded
+                diagnostic_available = True
+    except Exception:
+        # Helper output and stderr are deliberately excluded from the audit event.
+        pass
+
+    collisions = result.get("collisions") if isinstance(result, dict) else None
+    baseline_available = result.get("baseline_available") if isinstance(result, dict) else None
+    status = result.get("status") if isinstance(result, dict) else None
+    if (not diagnostic_available or status not in ("clean", "conflict")
+            or baseline_available is not True or not isinstance(collisions, list)
+            or any(not isinstance(row, dict) for row in collisions)
+            or (status == "conflict" and not collisions)):
+        status = "unknown"
+        collisions = []
+        diagnostic_available = False
+    elif status == "clean" and collisions:
+        # Do not report a contradictory payload as a clean comparison.
+        status = "unknown"
+        collisions = []
+
+    comparison_status = status
+    if freshness == "stale":
+        status = "unknown"
+
+    trace.emit("collision-radar", status=status, freshness=freshness,
+               comparison_status=comparison_status,
+               diagnostic_available=diagnostic_available,
+               baseline_available=baseline_available if isinstance(baseline_available, bool) else None,
+               collisions=collisions)
+    if freshness == "stale":
+        print("agent-push: collision radar used stale remote-tracking data because fetch failed",
+              file=sys.stderr)
+    if status == "unknown":
+        print("agent-push: collision radar could not produce a reliable diagnosis",
+              file=sys.stderr)
+        return result
     if not collisions:
-        return None
-    trace.emit("collision-radar", status=result.get("status"), collisions=collisions)
+        return result
     for row in collisions:
         paths = ", ".join(f"{p.get('type')}:{p.get('path')}" for p in row.get("paths", []))
         print("agent-push: collision detected with " + str(row.get("target"))
@@ -533,8 +568,9 @@ def wrapper(args):
         # the merge, and it never refuses the publication.
         try:
             radar_notice(worktree, common, repo_id, actor, session, trace, updates, remote=opt.remote)
-        except (OSError, ValueError):
-            pass
+        except Exception:
+            # Radar remains advisory; failures must not block publication.
+            print("agent-push: collision radar unavailable; publication proceeds", file=sys.stderr)
         leases = ["--force-with-lease=" + u["ref"] + ":" + ("" if zero(u["old"]) else u["old"]) for u in updates]
         p = subprocess.run(["git", "push", "--atomic", "--porcelain", *leases, opt.remote, *refspecs], env=env,
                            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
