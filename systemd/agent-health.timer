@@ -1,0 +1,9 @@
+[Unit]
+Description=Daily agent-tooling health report
+
+[Timer]
+OnCalendar=*-*-* 09:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

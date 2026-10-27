@@ -1,0 +1,6 @@
+[Unit]
+Description=Read-only agent-tooling health report
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/agent-health --repos-file %h/.config/agent-tooling/health-repos --json

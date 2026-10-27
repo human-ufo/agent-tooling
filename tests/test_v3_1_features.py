@@ -218,12 +218,17 @@ class PushRadarNoticeTests(PublishFixture):
         # The publication happened anyway.
         self.assertEqual(self.remote_sha(), self.git("rev-parse", "HEAD").stdout.strip())
 
-    def test_a_clean_publication_does_not_report_a_collision(self):
+    def test_a_clean_publication_records_clean_radar_and_publishes(self):
+        self.git('--git-dir', str(self.remote), 'update-ref', 'refs/heads/main', self.first)
+        self.git('--git-dir', str(self.remote), 'symbolic-ref', 'HEAD', 'refs/heads/main')
         self.commit("next")
         result = self.push("origin", "HEAD:refs/heads/topic", check=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("collision detected", result.stderr)
-        self.assertFalse(any(e["event"] == "collision-radar" for e in self.events()))
+        radar = [e for e in self.events() if e["event"] == "collision-radar"]
+        self.assertEqual(len(radar), 1)
+        self.assertEqual(radar[0]["status"], "clean")
+        self.assertEqual(radar[0]["freshness"], "refreshed")
 
 
 class MergeTreeParsingTests(unittest.TestCase):

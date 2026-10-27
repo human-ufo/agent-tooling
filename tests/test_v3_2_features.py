@@ -122,9 +122,91 @@ class BranchIntegrationTests(LifecycleFixture):
         payload = json.loads(result.stdout)
         self.assertNotIn(first['session'], [s['session'] for s in payload['sessions']])
 
+    def test_partial_squash_with_pending_nested_readme_stays_active(self):
+        first = self.opened('partial-squash')
+        worktree = Path(first['path'])
+        (worktree / 'docs').mkdir()
+        (worktree / 'docs/README.md').write_text('unique documentation\n')
+        (worktree / 'shared.txt').write_text('integrated code\n')
+        self.fixture.run_git(worktree, 'add', '.')
+        self.fixture.run_git(worktree, 'commit', '-qm', 'code and nested documentation')
+        self.fixture.run_git(self.repo, 'checkout', '-q', '-b', 'squash', 'origin/main')
+        (self.repo / 'shared.txt').write_text('integrated code\n')
+        self.fixture.run_git(self.repo, 'add', '.')
+        self.fixture.run_git(self.repo, 'commit', '-qm', 'only code integrated')
+        self.fixture.run_git(self.repo, 'push', '-q', 'origin', 'HEAD:refs/heads/main')
+        result = self.wt('gc', self.repo, '--json')
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual(json.loads(result.stdout)['cleaned'], [])
+        self.assertTrue(worktree.exists())
+        self.assertEqual((worktree / 'docs/README.md').read_text(), 'unique documentation\n')
+        radar = self.wt('radar', self.repo, '--json')
+        self.assertEqual(radar.returncode, 0, radar.stderr + radar.stdout)
+        self.assertIn(first['session'], [s['session'] for s in json.loads(radar.stdout)['sessions']])
+
+    def test_radar_without_remote_baseline_is_unknown(self):
+        self.opened('missing-baseline')
+        self.fixture.run_git(self.fixture.origin, 'symbolic-ref', 'HEAD', 'refs/heads/missing')
+        result = self.wt('radar', self.repo, '--json')
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload['baseline_available'])
+        self.assertEqual(payload['status'], 'unknown')
+
 
 class CollectorTests(LifecycleFixture):
     """agent-worktree gc closes the sessions that are already integrated."""
+
+    def test_gc_preserves_a_unique_detached_head_and_its_lock(self):
+        opened = self.opened('unique-detached')
+        self.lock('acquire', self.repo, '--branch', opened['branch'],
+                  '--agent', 'codex', '--session', opened['session'], '--json')
+        self.fixture.run_git(opened['path'], 'checkout', '--detach', '-q')
+        unique_oid = self.commit(opened['path'])
+        result = self.wt('gc', self.repo, '--json')
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual(json.loads(result.stdout)['cleaned'], [])
+        self.assertTrue(Path(opened['path']).exists())
+        self.assertEqual(self.fixture.run_git(opened['path'], 'rev-parse', 'HEAD').stdout.strip(), unique_oid)
+        self.assertEqual(json.loads(self.state_file().read_text())['sessions'][0]['session'], opened['session'])
+        self.assertTrue(list(self.locks.glob('*.lock')))
+
+    def test_gc_preserves_a_detached_head_even_without_new_commits(self):
+        opened = self.opened('detached-base')
+        self.fixture.run_git(opened['path'], 'checkout', '--detach', '-q')
+        result = self.wt('gc', self.repo, '--json')
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual(json.loads(result.stdout)['cleaned'], [])
+        self.assertTrue(Path(opened['path']).exists())
+
+    def test_gc_adopts_renamed_branch_but_keeps_its_unique_work(self):
+        opened = self.opened('renamed-pending')
+        self.fixture.run_git(opened['path'], 'checkout', '-q', '-b', 'feat/pending')
+        oid = self.commit(opened['path'])
+        result = self.wt('gc', self.repo, '--json')
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual(json.loads(result.stdout)['cleaned'], [])
+        self.assertTrue(Path(opened['path']).exists())
+        self.assertEqual(self.fixture.run_git(opened['path'], 'rev-parse', 'HEAD').stdout.strip(), oid)
+        self.assertEqual(json.loads(self.state_file().read_text())['sessions'][0]['branch'], 'feat/pending')
+
+    def test_gc_refuses_to_collect_after_failed_remote_refresh(self):
+        opened = self.opened('offline')
+        self.fixture.run_git(self.repo, 'remote', 'set-url', 'origin', str(Path(self.tmp) / 'missing'))
+        result = self.wt('gc', self.repo, '--json')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('remote refresh failed', result.stdout)
+        self.assertTrue(Path(opened['path']).exists())
+        self.assertEqual(len(json.loads(self.state_file().read_text())['sessions']), 1)
+
+    def test_gc_keeps_missing_worktree_record_for_explicit_reconciliation(self):
+        opened = self.opened('missing')
+        removed = self.fixture.run_git(self.repo, 'worktree', 'remove', opened['path'])
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        result = self.wt('gc', self.repo, '--json')
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual(json.loads(result.stdout)['cleaned'], [])
+        self.assertEqual(len(json.loads(self.state_file().read_text())['sessions']), 1)
 
     def test_gc_closes_an_integrated_session_and_releases_its_lock(self):
         opened = self.opened('integrated')

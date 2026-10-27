@@ -501,12 +501,13 @@ def detect_collisions(repo, source_oid, source_label, targets, exclude_branch=No
             # A merge that cannot even be computed is reported as unknown
             # rather than as a clean result.
             collisions.append({'target': label, 'type': 'unknown', 'paths': [],
-                               'detail': (p.stderr or p.stdout).strip()[:200]})
+                               'detail': 'merge comparison unavailable'})
             continue
         paths = merge_tree_conflicts(p.stdout)
         collisions.append({'target': label, 'type': 'collision', 'paths': paths})
     return {'source': source_label, 'collisions': collisions,
-            'status': 'conflict' if collisions else 'clean'}
+            'status': ('unknown' if any(c['type'] == 'unknown' for c in collisions)
+                       else 'conflict' if collisions else 'clean')}
 
 
 INDEX_BASENAMES = ('AI_KNOWLEDGE_MAP.md', 'README.md', 'AGENDA.md')
@@ -554,7 +555,7 @@ def is_branch_integrated(repo, oid, default_oid, base_oid=None):
     if changed.returncode != 0:
         return False
     files = [line.strip() for line in changed.stdout.splitlines() if line.strip()]
-    substantive = [name for name in files if os.path.basename(name) not in INDEX_BASENAMES]
+    substantive = [name for name in files if name not in INDEX_BASENAMES]
     if not substantive:
         return False
     for name in substantive:
@@ -652,6 +653,9 @@ def radar(args, repo):
     for row in active_branches(repo, records, exclude_session=source['session'], default_oid=default_oid):
         targets.append((row['branch'], row['oid']))
     result = detect_collisions(repo, source['oid'], source['branch'], targets)
+    result['baseline_available'] = bool(default_ref and default_oid)
+    if not result['baseline_available']:
+        result['status'] = 'unknown'
     result['repo_id'] = repo['repo_id']
     result['source'] = source
     result['sessions'] = active_branches(repo, records, default_oid=default_oid)
@@ -730,8 +734,12 @@ def worktree_command(args):
             # default branch. A session that merged its pull request and
             # forgot to close its worktree keeps its branch in the registry
             # and makes every later radar report a false conflict.
-            git(repo['repo'], 'fetch', '--quiet', args.remote, check=False)
+            refreshed = git(repo['repo'], 'fetch', '--quiet', args.remote, check=False)
+            if refreshed.returncode:
+                raise Failure('gc remote refresh failed; all sessions retained')
             _, default_oid = default_branch_oid(repo, args.remote)
+            if not default_oid:
+                raise Failure('gc remote baseline unavailable; all sessions retained')
             actual_map = {r['worktree']: r for r in registered_worktrees(repo)}
             lock_root = directory('locks')
             cleaned, kept = [], []
@@ -741,12 +749,17 @@ def worktree_command(args):
                     continue
                 path = Path(rec['path'])
                 actual = actual_map.get(os.path.realpath(path))
-                if actual and path.is_dir() and actual.get('branch') != f"refs/heads/{rec['branch']}":
-                    sync_session_branch(file, root, repo, records, rec, actual, args)
+                if not actual or not path.is_dir():
+                    kept.append(rec)
+                    continue
+                if actual.get('branch') != f"refs/heads/{rec['branch']}":
+                    if not sync_session_branch(file, root, repo, records, rec, actual, args):
+                        kept.append(rec)
+                        continue
                 lfile = lock_path(lock_root, repo, rec['branch'])
                 if lfile.exists():
                     try:
-                        ldata = read_json(lfile)
+                        ldata = validate_lock(read_json(lfile), repo, rec['branch'])
                     except Failure:
                         ldata = None
                     if not isinstance(ldata, dict):
@@ -766,17 +779,25 @@ def worktree_command(args):
                 if not is_branch_integrated(repo, branch_oid, default_oid, rec.get('base_oid')):
                     kept.append(rec)
                     continue
-                if actual and path.is_dir():
-                    dirty = git(path, 'status', '--porcelain', '--untracked-files=all', '--ignored=matching', check=False).stdout
-                    if dirty:
-                        kept.append(rec)
-                        continue
-                    try:
-                        git(repo['repo'], 'worktree', 'remove', str(path))
-                    except Failure:
-                        kept.append(rec)
-                        continue
-                elif path.exists():
+                status = git(path, 'status', '--porcelain', '--untracked-files=all', '--ignored=matching', check=False)
+                if status.returncode or status.stdout:
+                    kept.append(rec)
+                    continue
+                # Inspect the checkout itself, not only the branch recorded at
+                # session open. A detached or concurrently changed HEAD must
+                # retain its worktree even when the old branch is integrated.
+                head = git(path, 'rev-parse', '--verify', 'HEAD', check=False)
+                attached = git(path, 'symbolic-ref', '--quiet', 'HEAD', check=False)
+                retained = git(repo['repo'], 'rev-parse', '--verify', ref, check=False)
+                if (head.returncode or attached.returncode or retained.returncode
+                        or attached.stdout.strip() != ref
+                        or head.stdout.strip() != branch_oid
+                        or retained.stdout.strip() != branch_oid):
+                    kept.append(rec)
+                    continue
+                try:
+                    git(repo['repo'], 'worktree', 'remove', str(path))
+                except Failure:
                     kept.append(rec)
                     continue
                 released = release_own_lock(lock_root, repo, rec['branch'], rec['agent'], rec['session'], args,
