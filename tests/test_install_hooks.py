@@ -70,7 +70,7 @@ class InstallerTests(PublishFixture):
         # so this repository identifies as one of them.
         self.git("remote", "set-url", "origin", "https://github.com/human-ufo/personal-docs.git")
         if True:
-            lint = self.home / ".agents/skills/docs-writer/pre-commit"
+            lint = self.home / ".agents/skills/documentar/pre-commit"
             lint.parent.mkdir(parents=True)
             lint_result = self.base / "lint-ran"
             lint.write_text("#!/bin/sh\nprintf yes >" + str(lint_result) + "\n")
@@ -130,7 +130,7 @@ class RemovedHookTests(PublishFixture):
 
     def test_documentation_lint_is_removed_when_it_no_longer_applies(self):
         # The lint source has to exist, otherwise it is never installed.
-        lint = self.home / ".agents/skills/docs-writer/pre-commit"
+        lint = self.home / ".agents/skills/documentar/pre-commit"
         lint.parent.mkdir(parents=True, exist_ok=True)
         lint.write_text("#!/bin/sh\nexit 0\n")
         lint.chmod(0o755)

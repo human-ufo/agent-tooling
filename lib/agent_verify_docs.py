@@ -32,8 +32,15 @@ import re
 import subprocess
 import sys
 
-# Linter de documentación por defecto: el skill docs-writer del usuario.
-DOCS_LINT_RELATIVE = ".agents/skills/docs-writer/lint_docs.py"
+# Linter de documentación por defecto: el skill `documentar` del usuario, que
+# es el único punto de entrada de la documentación. La ruta vieja se conserva
+# como último recurso para que una instalación que todavía no se actualizó no
+# se quede sin linter; el orden es: preferencia, respaldo.
+DOCS_LINT_RELATIVES = (
+    ".agents/skills/documentar/lint_docs.py",
+    ".agents/skills/docs-writer/lint_docs.py",
+)
+DOCS_LINT_RELATIVE = DOCS_LINT_RELATIVES[0]
 # Linter de tareas por defecto: vive dentro del repositorio verificado.
 TASKS_LINT_RELATIVE = "scripts/lint_tasks.py"
 
@@ -184,12 +191,21 @@ def linter_source(args, repo):
         names = DOCS_LINT_ENV
         home = os.environ.get("HOME") or str(Path.home())
         default = str(Path(home) / DOCS_LINT_RELATIVE)
-        hint = ("Instalá el skill docs-writer o configurá la ruta con --lint o con "
+        hint = ("Instalá el skill documentar o configurá la ruta con --lint o con "
                 "la variable de entorno DOCS_LINT.")
     for name in names:
         value = os.environ.get(name)
         if value:
             return value, hint
+    if args.profile != "tasks":
+        # Perfil de documentación: sin ruta explícita se prefiere la del skill
+        # actual y, si no está, la del skill retirado. Un rename del skill no
+        # debe dejar al push sin linter.
+        home = os.environ.get("HOME") or str(Path.home())
+        for relative in DOCS_LINT_RELATIVES:
+            candidate = Path(home) / relative
+            if candidate.is_file():
+                return str(candidate), hint
     return default, hint
 
 
