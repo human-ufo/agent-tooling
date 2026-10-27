@@ -90,7 +90,7 @@ def load_linter(path, hint):
 class DocsProfile:
     """Perfil de los repos de gobernanza documental (personal-docs, avla-docs-reporteria).
 
-    Reproduce la regla de severidad del `pre-commit` de docs-writer: un
+    Reproduce la regla de severidad del `pre-commit` del skill documentar: un
     documento nuevo tiene que pasar todas las reglas, y un documento previo
     modificado solo bloquea por los errores críticos.
     """
