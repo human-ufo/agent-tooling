@@ -53,7 +53,23 @@ class RadarObservabilityTests(unittest.TestCase):
         self.assertEqual(event["status"], "clean")
         self.assertEqual(event["freshness"], "refreshed")
         self.assertTrue(event["diagnostic_available"])
+        self.assertFalse(event["index_only"])
         self.assertEqual(warning, "")
+
+    def test_index_only_overlap_notice_does_not_ask_to_delay_merging_into_trunk(self):
+        result, event, warning = self.invoke(responses=[(0, json.dumps({
+            "status": "conflict", "baseline_available": True, "index_only": True,
+            "collisions": [{
+                "target": "chore/other-session", "type": "collision", "index_only": True,
+                "paths": [{"type": "content", "path": "AI_KNOWLEDGE_MAP.md"}]
+            }]
+        }))])
+        self.assertEqual(result["status"], "conflict")
+        self.assertEqual(event["status"], "conflict")
+        self.assertTrue(event["index_only"])
+        self.assertIn("regenerable index overlap with chore/other-session: content:AI_KNOWLEDGE_MAP.md", warning)
+        self.assertIn("can be merged cleanly into trunk", warning)
+        self.assertNotIn("coordinate before merging", warning)
 
     def test_fetch_failure_marks_unknown_and_keeps_partial_conflict_diagnosis(self):
         result, event, warning = self.invoke(fetch_code=1, responses=[(0, json.dumps({
