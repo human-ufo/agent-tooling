@@ -462,10 +462,12 @@ def radar_notice(worktree, common, repo_id, actor, session, trace, updates, remo
     if freshness == "stale":
         status = "unknown"
 
+    index_only = bool(collisions) and all(row.get("index_only") is True for row in collisions)
     trace.emit("collision-radar", status=status, freshness=freshness,
                comparison_status=comparison_status,
                diagnostic_available=diagnostic_available,
                baseline_available=baseline_available if isinstance(baseline_available, bool) else None,
+               index_only=index_only,
                collisions=collisions)
     if freshness == "stale":
         print("agent-push: collision radar used stale remote-tracking data because fetch failed",
@@ -478,10 +480,18 @@ def radar_notice(worktree, common, repo_id, actor, session, trace, updates, remo
         return result
     for row in collisions:
         paths = ", ".join(f"{p.get('type')}:{p.get('path')}" for p in row.get("paths", []))
-        print("agent-push: collision detected with " + str(row.get("target"))
-              + ((": " + paths) if paths else ""), file=sys.stderr)
-    print("agent-push: the publication proceeds; coordinate before merging the pull request",
-          file=sys.stderr)
+        if row.get("index_only") is True:
+            print("agent-push: regenerable index overlap with " + str(row.get("target"))
+                  + ((": " + paths) if paths else ""), file=sys.stderr)
+        else:
+            print("agent-push: collision detected with " + str(row.get("target"))
+                  + ((": " + paths) if paths else ""), file=sys.stderr)
+    if index_only:
+        print("agent-push: the publication proceeds; only regenerable index files overlap with other sessions, so this pull request can be merged cleanly into trunk",
+              file=sys.stderr)
+    else:
+        print("agent-push: the publication proceeds; coordinate before merging the pull request",
+              file=sys.stderr)
     return result
 
 

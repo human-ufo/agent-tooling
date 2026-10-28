@@ -150,6 +150,35 @@ class RadarTests(LifecycleFixture):
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertEqual(self.fixture.run_git(first['path'], 'status', '--porcelain').stdout, before)
 
+    def test_radar_marks_regenerable_index_collision_with_another_session_as_index_only(self):
+        first = self.opened('one')
+        second = self.opened('two')
+        self.write(first['path'], '01/doc-a.md', 'doc a\n')
+        self.write(first['path'], 'AI_KNOWLEDGE_MAP.md', 'map from one\n')
+        self.write(second['path'], '02/doc-b.md', 'doc b\n')
+        self.write(second['path'], 'AI_KNOWLEDGE_MAP.md', 'map from two\n')
+        result = self.wt('radar', self.repo, '--session', 'one', '--json')
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload['status'], 'conflict')
+        self.assertTrue(payload['index_only'])
+        self.assertEqual(len(payload['collisions']), 1)
+        self.assertTrue(payload['collisions'][0]['index_only'])
+
+    def test_radar_does_not_mark_collision_against_default_branch_as_index_only(self):
+        first = self.opened('one')
+        self.write(first['path'], 'AI_KNOWLEDGE_MAP.md', 'map from one\n')
+        self.fixture.run_git(self.repo, 'checkout', '-q', '-b', 'trunk-advance', 'origin/main')
+        self.write(self.repo, 'AI_KNOWLEDGE_MAP.md', 'map on main\n')
+        self.fixture.run_git(self.repo, 'push', '-q', 'origin', 'HEAD:refs/heads/main')
+        self.fixture.run_git(self.repo, 'fetch', '-q', 'origin', 'main:refs/remotes/origin/main')
+        result = self.wt('radar', self.repo, '--session', 'one', '--json')
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload['status'], 'conflict')
+        self.assertFalse(payload['index_only'])
+        self.assertFalse(payload['collisions'][0]['index_only'])
+
 
 class VerifyQueueTests(PublishFixture):
     """F3: the verifiers of one repository run in a FIFO queue."""

@@ -480,7 +480,30 @@ def merge_tree_conflicts(output):
     return conflicts
 
 
-def detect_collisions(repo, source_oid, source_label, targets, exclude_branch=None):
+GENERATED_INDEX_BASENAMES = ('AI_KNOWLEDGE_MAP.md', 'AGENDA.md')
+
+
+def is_index_only_collision(target, paths, default_ref=None):
+    """Say whether a collision against another session only touches regenerable index files.
+
+    A collision against the default branch (trunk) is never index-only, because
+    GitHub will refuse to merge the pull request until the branch is rebased
+    and the index is regenerated. Against another session branch, a collision
+    restricted to auto-generated index files (`AI_KNOWLEDGE_MAP.md`, `AGENDA.md`)
+    does not prevent merging this pull request into trunk.
+    """
+    if default_ref and target == default_ref:
+        return False
+    if not paths or not isinstance(paths, list):
+        return False
+    return all(isinstance(p, dict)
+               and p.get('path')
+               and Path(p['path']).name in GENERATED_INDEX_BASENAMES
+               and p.get('type') not in (None, 'unknown')
+               for p in paths)
+
+
+def detect_collisions(repo, source_oid, source_label, targets, exclude_branch=None, default_ref=None):
     """Replay a three-way merge in memory to find textual collisions.
 
     git merge-tree --write-tree computes the merge without touching any working
@@ -501,11 +524,14 @@ def detect_collisions(repo, source_oid, source_label, targets, exclude_branch=No
             # A merge that cannot even be computed is reported as unknown
             # rather than as a clean result.
             collisions.append({'target': label, 'type': 'unknown', 'paths': [],
+                               'index_only': False,
                                'detail': 'merge comparison unavailable'})
             continue
         paths = merge_tree_conflicts(p.stdout)
-        collisions.append({'target': label, 'type': 'collision', 'paths': paths})
+        collisions.append({'target': label, 'type': 'collision', 'paths': paths,
+                           'index_only': is_index_only_collision(label, paths, default_ref=default_ref)})
     return {'source': source_label, 'collisions': collisions,
+            'index_only': bool(collisions) and all(c.get('index_only') is True for c in collisions),
             'status': ('unknown' if any(c['type'] == 'unknown' for c in collisions)
                        else 'conflict' if collisions else 'clean')}
 
@@ -652,7 +678,7 @@ def radar(args, repo):
         targets.append((default_ref, default_oid))
     for row in active_branches(repo, records, exclude_session=source['session'], default_oid=default_oid):
         targets.append((row['branch'], row['oid']))
-    result = detect_collisions(repo, source['oid'], source['branch'], targets)
+    result = detect_collisions(repo, source['oid'], source['branch'], targets, default_ref=default_ref)
     result['baseline_available'] = bool(default_ref and default_oid)
     if not result['baseline_available']:
         result['status'] = 'unknown'
