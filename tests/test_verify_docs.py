@@ -103,6 +103,14 @@ class VerifyDocsTests(PublishFixture):
     def verifications(self):
         return [e for e in self.events() if e["event"] == "verification"]
 
+    def seed_legacy_remote_document(self):
+        """Establish pre-existing legacy content before enabling the gate."""
+        self.git("config", "agent.pushVerifyMode", "optional")
+        self.git("config", "--unset", "agent.pushVerify")
+        self.git("push", "-q", "origin", "HEAD:refs/heads/topic")
+        self.git("config", "agent.pushVerify", str(VERIFIER))
+        self.git("config", "agent.pushVerifyMode", "required")
+
     def test_valid_document_is_published_and_verification_passes(self):
         self.write_doc("2026-10-23_Documento_Valido.md", VALID_DOC)
         self.push("origin", "HEAD:refs/heads/topic")
@@ -120,6 +128,97 @@ class VerifyDocsTests(PublishFixture):
         self.assertEqual(self.remote_sha(), self.first)
         self.assertTrue(any(e.get("result") == "failed" for e in self.verifications()))
 
+    def test_push_checks_markdown_from_earlier_commit_in_the_range(self):
+        self.write_doc("2026-10-23_Documento_Con_Mojibake.md", MOJIBAKE_DOC)
+        self.commit("cambio posterior sin documentos")
+        p = self.push("origin", "HEAD:refs/heads/topic", check=False)
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.remote_sha(), self.first)
+
+    def test_new_branch_checks_the_entire_final_markdown_tree(self):
+        self.git("--git-dir", str(self.remote), "symbolic-ref", "HEAD", "refs/heads/topic")
+        self.write_doc("2026-10-23_Documento_Con_Mojibake.md", MOJIBAKE_DOC)
+        self.commit("cambio posterior sin documentos")
+        p = self.push("origin", "HEAD:refs/heads/new-topic", check=False)
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertNotEqual(self.git("--git-dir", str(self.remote), "show-ref", "--verify",
+                                     "refs/heads/new-topic", check=False).returncode, 0)
+
+    def test_new_branch_without_default_checks_all_markdown(self):
+        self.write_doc("2026-10-23_Documento_Valido.md", MOJIBAKE_DOC)
+        p = self.push("origin", "HEAD:refs/heads/new-topic", check=False)
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertNotEqual(self.git("--git-dir", str(self.remote), "show-ref", "--verify",
+                                     "refs/heads/new-topic", check=False).returncode, 0)
+
+    def test_empty_remote_bootstrap_checks_all_markdown(self):
+        self.git("--git-dir", str(self.remote), "update-ref", "-d", "refs/heads/topic")
+        self.write_doc("2026-10-23_Documento_Valido.md", VALID_DOC)
+        p = self.push("origin", "HEAD:refs/heads/new-topic", check=False)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.remote_sha("new-topic"), self.git("rev-parse", "HEAD").stdout.strip())
+
+    def test_unavailable_explicit_base_fails_closed(self):
+        self.write_doc("2026-10-23_Documento_Valido.md", VALID_DOC)
+        target = self.git("rev-parse", "HEAD").stdout.strip()
+        env = dict(self.env, AGENT_VERIFY_OLD_SHA="f" * 40)
+        p = self.command(str(VERIFIER), target, env=env, check=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("commit base de publicación no está disponible", p.stderr)
+
+    def test_new_branch_uses_default_baseline_so_unchanged_legacy_docs_pass(self):
+        self.write_doc("Nombre_Fuera_De_Patron.md", VALID_DOC)
+        self.seed_legacy_remote_document()
+        self.git("--git-dir", str(self.remote), "symbolic-ref", "HEAD", "refs/heads/topic")
+        self.write_doc("2026-10-23_Documento_Valido.md", VALID_DOC)
+        p = self.push("origin", "HEAD:refs/heads/new-topic", check=False)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.remote_sha("new-topic"), self.git("rev-parse", "HEAD").stdout.strip())
+
+    def test_new_branch_baseline_cannot_be_spoofed_by_the_environment(self):
+        self.git("--git-dir", str(self.remote), "symbolic-ref", "HEAD", "refs/heads/topic")
+        self.write_doc("2026-10-23_Documento_Con_Mojibake.md", MOJIBAKE_DOC)
+        target = self.git("rev-parse", "HEAD").stdout.strip()
+        self.commit("commit posterior sin documentos")
+        env = dict(self.env, AGENT_VERIFY_BASE_SHA=target, AGENT_VERIFY_OLD_SHA=target)
+        p = self.command(str(ROOT / "bin/agent-push"), "origin", "HEAD:refs/heads/new-topic",
+                         env=env, check=False)
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertNotEqual(self.git("--git-dir", str(self.remote), "show-ref", "--verify",
+                                     "refs/heads/new-topic", check=False).returncode, 0)
+
+    def test_rewrite_checks_final_tree_against_remote_old_sha(self):
+        self.write_doc("Nombre_Fuera_De_Patron.md", VALID_DOC)
+        self.seed_legacy_remote_document()
+        remote_before_rewrite = self.git("rev-parse", "HEAD").stdout.strip()
+        self.git("checkout", "-qb", "rewrite", self.first)
+        self.write_doc("Nombre_Fuera_De_Patron.md", MOJIBAKE_DOC)
+        self.commit("commit posterior sin documentos")
+        p = self.push("--rewrite", "origin", "rewrite:refs/heads/topic", check=False)
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.remote_sha(), remote_before_rewrite)
+
+    def test_merge_checks_markdown_in_merged_tree(self):
+        self.git("branch", "docs-side")
+        self.git("checkout", "-q", "docs-side")
+        self.write_doc("2026-10-23_Documento_Con_Mojibake.md", MOJIBAKE_DOC)
+        self.git("checkout", "-q", "topic")
+        self.commit("commit de topic sin documentos")
+        self.git("merge", "--no-ff", "-qm", "merge docs side", "docs-side")
+        p = self.push("origin", "HEAD:refs/heads/topic", check=False)
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.remote_sha(), self.first)
+
+    def test_ambient_base_sha_cannot_spoof_the_hook_baseline(self):
+        self.write_doc("2026-10-23_Documento_Con_Mojibake.md", MOJIBAKE_DOC)
+        target = self.git("rev-parse", "HEAD").stdout.strip()
+        self.commit("commit posterior sin documentos")
+        env = dict(self.env, AGENT_VERIFY_OLD_SHA=target)
+        p = self.command(str(ROOT / "bin/agent-push"), "origin", "HEAD:refs/heads/topic",
+                         env=env, check=False)
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.remote_sha(), self.first)
+
     def test_commit_without_markdown_is_published(self):
         self.commit("sin documentos")
         self.push("origin", "HEAD:refs/heads/topic")
@@ -130,6 +229,7 @@ class VerifyDocsTests(PublishFixture):
         # El documento ya estaba publicado con un nombre fuera del patrón: al
         # modificarlo, ese problema es un aviso y no bloquea.
         self.write_doc("Nombre_Fuera_De_Patron.md", VALID_DOC)
+        self.seed_legacy_remote_document()
         self.write_doc("Nombre_Fuera_De_Patron.md", VALID_DOC + "Segunda edicion.\n")
         self.push("origin", "HEAD:refs/heads/topic")
         self.assertEqual(self.remote_sha(), self.git("rev-parse", "HEAD").stdout.strip())

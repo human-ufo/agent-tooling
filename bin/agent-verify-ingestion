@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+"""Offline ingestion safety gate on the announced checkout; not full CI."""
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+
+def main():
+    if len(sys.argv) != 2:
+        print("expected announced commit SHA", file=sys.stderr)
+        return 2
+    def git(*args):
+        return subprocess.run(["git", *args], capture_output=True, text=True)
+    announced = git("rev-parse", "--verify", sys.argv[1] + "^{commit}")
+    head = git("rev-parse", "HEAD")
+    if announced.returncode or head.returncode or announced.stdout != head.stdout:
+        print("verification checkout differs from announced commit", file=sys.stderr)
+        return 1
+    clean = git("status", "--porcelain", "--untracked-files=all")
+    if clean.returncode or clean.stdout:
+        print("verification requires a clean checkout", file=sys.stderr)
+        return 1
+    check = Path(".github/scripts/check-repository-safety.sh")
+    if not check.is_file() or any(p.is_symlink() for p in (check, *check.parents)):
+        print("required check must be a regular in-checkout file", file=sys.stderr)
+        return 1
+    if not check.resolve().is_relative_to(Path.cwd().resolve()):
+        print("required repository-safety check is missing", file=sys.stderr)
+        return 1
+    # The upstream scanner can print matching credentials. Never forward its
+    # output into push logs, including successful mocked-test output.
+    env = {k: v for k, v in os.environ.items()
+           if k in {"PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "LANG"}
+           or k.startswith("LC_")}
+    try:
+        result = subprocess.run(["bash", str(check)], env=env,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                timeout=240)
+    except (OSError, subprocess.TimeoutExpired):
+        print("repository-safety could not complete", file=sys.stderr)
+        return 1
+    if result.returncode:
+        print("FAIL repository-safety (scanner output suppressed to protect credentials)", file=sys.stderr)
+        return 1
+    print("PASS repository-safety (including its chained checks; not full CI)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
