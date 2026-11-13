@@ -6,8 +6,8 @@ anunciado y le pasa ese SHA como argumento final. El verificador:
 
   1. resuelve el objeto anunciado y comprueba que el checkout corresponde a ese
      commit;
-  2. lista los `.md` agregados y modificados **en ese commit**, con
-     `git diff-tree`, sin usar `origin/main`;
+  2. lista los `.md` agregados y modificados en el diff de la base del push al
+     árbol final anunciado, sin depender de `origin/main`;
   3. corre el linter de documentación sobre esos archivos con la misma regla de
      severidad que el `pre-commit`: un documento nuevo tiene que pasar todas las
      reglas; un documento previo modificado solo bloquea por errores críticos
@@ -233,12 +233,14 @@ def resolve_commit(repo, sha):
     return commit
 
 
-def changed_markdown(repo, commit):
-    """Nombres de los `.md` agregados y modificados en ese commit.
+def changed_markdown(repo, commit, base=None, merge_base=False):
+    """Devuelve Markdown agregado/modificado entre base y el árbol final.
 
-    `git diff-tree` contra el primer progenitor evita depender de `origin/main`,
-    que no existe en el checkout descartable. `--root` cubre el commit inicial
-    y `--first-parent` las fusiones, donde el diff simple no lista nada.
+    Un SHA base explícito permite cubrir todos los commits de un push, también
+    rewrites y merges, sin depender de `origin/main`. Para refs nuevas es el
+    SHA observado del default remoto y se usa su merge-base con el objetivo. Si
+    no hay ancestro común, o no hay base (uso standalone compatible), revisa
+    todo Markdown rastreado y lo clasifica como nuevo.
 
     `--no-renames` fija la detección de renombres en apagada, así el resultado
     no depende de la configuración `diff.renames` del usuario. Un archivo
@@ -246,8 +248,29 @@ def changed_markdown(repo, commit):
     las reglas, que es más estricto que el `pre-commit` (allí un renombre no
     llega al linter) pero más coherente con la regla de nombres.
     """
-    out = run_git("diff-tree", "--root", "-m", "--first-parent", "--no-commit-id",
-                  "--name-status", "-r", "-z", "--no-renames", commit, cwd=str(repo))
+    if base is None or (base and set(base) == {"0"}):
+        out = run_git("ls-tree", "-r", "--name-only", "-z", commit, cwd=str(repo))
+        changed = [name for name in out.split("\0") if name.endswith(".md")]
+        return changed, set(changed)
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", base):
+        raise VerificationError("el SHA base de publicación no es válido: " + str(base))
+    old = subprocess.run(["git", "rev-parse", "--verify", "--quiet", base + "^{commit}"],
+                         cwd=str(repo), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if old.returncode or not old.stdout.strip():
+        raise VerificationError("el commit base de publicación no está disponible: " + base)
+    comparison_base = old.stdout.strip()
+    if merge_base:
+        common = subprocess.run(["git", "merge-base", comparison_base, commit],
+                                cwd=str(repo), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if common.returncode or not common.stdout.strip():
+            # No common history is not a clean diff: conservatively validate
+            # every Markdown file as new.
+            out = run_git("ls-tree", "-r", "--name-only", "-z", commit, cwd=str(repo))
+            changed = [name for name in out.split("\0") if name.endswith(".md")]
+            return changed, set(changed)
+        comparison_base = common.stdout.strip()
+    out = run_git("diff", "--name-status", "-z", "--no-renames",
+                  comparison_base, commit, cwd=str(repo))
     fields = out.split("\0")
     changed, added = [], set()
     index = 0
@@ -354,7 +377,15 @@ def main(argv):
     try:
         repo = Path(run_git("rev-parse", "--show-toplevel").strip()).resolve()
         commit = resolve_commit(repo, sha)
-        changed, added = changed_markdown(repo, commit)
+        old = os.environ.get("AGENT_VERIFY_OLD_SHA")
+        if old and set(old) == {"0"}:
+            base = os.environ.get("AGENT_VERIFY_BASE_SHA")
+            changed, added = changed_markdown(repo, commit, base=base, merge_base=bool(base))
+        else:
+            # Existing refs compare the exact old and new trees. This catches
+            # rewritten content even when old is not an ancestor of new.
+            base = old or os.environ.get("AGENT_VERIFY_BASE_SHA")
+            changed, added = changed_markdown(repo, commit, base=base)
         if not changed:
             print("agent-verify-docs: el commit " + commit[:12]
                   + " no agrega ni modifica documentos .md; nada que verificar.")

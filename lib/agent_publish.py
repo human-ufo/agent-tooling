@@ -53,6 +53,18 @@ def default_branch_ref(url):
     return None
 
 
+def remote_ref_sha(url, ref):
+    """Resolve one advertised remote ref to its exact commit object id."""
+    result = git("ls-remote", url, ref, check=False)
+    if result.returncode:
+        return None
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1] == ref and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", parts[0]):
+            return parts[0]
+    return None
+
+
 class Rejected(Exception):
     pass
 
@@ -75,9 +87,9 @@ def clean_env():
     return env
 
 
-def git(*args, cwd=None, check=True):
+def git(*args, cwd=None, check=True, timeout=None):
     p = subprocess.run(["git", *args], cwd=cwd, env=clean_env(), text=True,
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
     if check and p.returncode:
         raise Rejected(p.stderr.strip() or "git command failed")
     return p
@@ -275,7 +287,7 @@ def verify_queue(repo_id):
         yield
 
 
-def verify(worktree, update, trace, mode, command, repo_id=None):
+def verify(worktree, update, trace, mode, command, repo_id=None, remote_url=None):
     if zero(update["new"]):
         trace.emit("verification", ref=update["ref"], sha=update["new"], result="skipped", reason="deletion")
         return
@@ -304,6 +316,38 @@ def verify(worktree, update, trace, mode, command, repo_id=None):
                     git("-c", "core.hooksPath=/dev/null", "checkout", "--quiet", "--detach", target + "^{commit}", cwd=checkout)
                 else:
                     git("-c", "core.hooksPath=/dev/null", "checkout", "--quiet", "--detach", target, cwd=checkout)
+                # The hook's old SHA is the publication baseline. Verify it is
+                # present in the disposable object store before handing it to a
+                # verifier; a missing baseline must never silently narrow review.
+                old = update["old"]
+                baseline = old
+                if zero(old):
+                    default_ref = default_branch_ref(remote_url) if remote_url else None
+                    if default_ref:
+                        baseline = remote_ref_sha(remote_url, default_ref)
+                        if not baseline:
+                            raise Rejected("remote default-branch verification baseline is unavailable")
+                    else:
+                        advertised = git("ls-remote", remote_url, check=False)
+                        if advertised.returncode:
+                            raise Rejected("remote default-branch verification baseline could not be resolved")
+                        # An accessible remote without a default has no trusted
+                        # baseline. Verify the entire tree conservatively.
+                        baseline = "0" * len(old)
+                if not zero(baseline):
+                    exists = git("cat-file", "-e", baseline + "^{commit}", cwd=checkout, check=False)
+                    if exists.returncode:
+                        if zero(old):
+                            try:
+                                fetch = git("fetch", "--quiet", "--no-tags", remote_url, baseline,
+                                            cwd=checkout, check=False, timeout=30)
+                            except subprocess.TimeoutExpired as e:
+                                raise Rejected("remote default-branch verification baseline fetch timed out") from e
+                            if fetch.returncode:
+                                raise Rejected("remote default-branch verification baseline could not be fetched: " + baseline)
+                        exists = git("cat-file", "-e", baseline + "^{commit}", cwd=checkout, check=False)
+                        if exists.returncode:
+                            raise Rejected("publication base commit is unavailable in verification checkout: " + baseline)
                 # This is a trusted command, not a security sandbox: same UID can
                 # still read the filesystem. Ambient provider tokens are not passed.
                 allowed = {"PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "LANG", "SYSTEMROOT"}
@@ -315,6 +359,7 @@ def verify(worktree, update, trace, mode, command, repo_id=None):
                 allowed.update(additions)
                 env = {key: value for key, value in os.environ.items() if key in allowed or key.startswith("LC_")}
                 env.update(AGENT_VERIFY_REF=update["ref"], AGENT_VERIFY_SHA=update["new"],
+                           AGENT_VERIFY_OLD_SHA=old, AGENT_VERIFY_BASE_SHA=baseline,
                            AGENT_VERIFY_OBJECT_TYPE=kind or "unknown",
                            GIT_TERMINAL_PROMPT="0")
                 timeout_text = config("agent.pushVerifyTimeout") or "300"
@@ -397,7 +442,7 @@ def hook(args):
                 ff = git("merge-base", "--is-ancestor", old, new, check=False)
                 if ff.returncode and (not authorized or not authorized.get("rewrite")):
                     raise Rejected("non-fast-forward requires agent-push --rewrite with exact lease")
-            verify(worktree, update, trace, mode, command, repo_id=repo_id)
+            verify(worktree, update, trace, mode, command, repo_id=repo_id, remote_url=url)
         trace.emit("hook-accepted", updates=updates)
         if not authorized:
             trace.emit("remote-result", result="indeterminate", reason="raw git push: pre-push cannot observe remote result")

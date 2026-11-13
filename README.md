@@ -90,14 +90,20 @@ Git haya publicado: por eso el flujo de agentes no usa `git push` directo.
 
 El verificador se configura con `agent.pushVerify`: es una cadena de argumentos
 interpretada con `shlex`, sin shell; recibe el SHA anunciado como argumento
-final y `AGENT_VERIFY_SHA`/`AGENT_VERIFY_REF`/`AGENT_VERIFY_OBJECT_TYPE` en su
-entorno. Corre una vez por ref no borrada en un checkout descartable limpio de
+final y `AGENT_VERIFY_SHA`/`AGENT_VERIFY_OLD_SHA`/`AGENT_VERIFY_BASE_SHA`/
+`AGENT_VERIFY_REF`/`AGENT_VERIFY_OBJECT_TYPE` en su entorno. El hook comprueba
+la disponibilidad de la base y reemplaza cualquier valor ambiental con los
+SHA observados. Corre una vez por ref no borrada en un checkout descartable limpio de
 ese SHA. `optional` permite que no haya comando; cualquier comando configurado
 que falle bloquea **todo** el push, igual que `required`. `required` sin comando
 también bloquea. No se usa la antigua variable `AGENT_PUSH_VERIFY`. El timeout
 predeterminado es de 300 segundos por ref, configurable con
 `agent.pushVerifyTimeout` (1–86400). Para los repos de gobernanza documental
-hay un verificador listo, `bin/agent-verify-docs`, descrito más abajo.
+hay un verificador listo, `bin/agent-verify-docs`, descrito más abajo. Para el
+repositorio de ingesta hay un gate offline, `bin/agent-verify-ingestion`:
+comprueba el SHA y el checkout limpio, y ejecuta `.github/scripts/check-repository-safety.sh` con su
+salida suprimida. Es un gate de seguridad local, no reemplaza la suite completa
+de CI.
 
 La ruta del verificador debe ser absoluta: corre con el directorio de trabajo
 en el checkout descartable, donde una ruta relativa no existe.
@@ -106,23 +112,29 @@ en el checkout descartable, donde una ruta relativa no existe.
 
 `agent-verify-docs` es el verificador para los repos de gobernanza documental
 (`personal-docs`, `avla-docs-reporteria`) y para `agent-tasks`. Recibe el SHA
-anunciado como argumento final, en el mismo contrato que cualquier otro
-verificador de `agent.pushVerify`.
+anunciado como argumento final y recibe del hook `AGENT_VERIFY_OLD_SHA` y
+`AGENT_VERIFY_BASE_SHA`. Los pushes a refs existentes comparan los árboles del
+SHA anterior y el nuevo; cubren todos los commits incluidos, además de merges y
+rewrites. Para una ref nueva, la base es el SHA anunciado del default remoto y
+se compara desde el merge-base con el commit publicado. Si el remoto está vacío,
+se revisa todo el árbol; lo mismo ocurre cuando el remoto accesible no anuncia
+una rama por defecto. Si no se puede consultar el remoto, el push falla cerrado. Una ejecución standalone sin base también revisa todo el
+árbol como documentos nuevos.
 
 Qué hace, en este orden:
 
 1. Resuelve el objeto anunciado y comprueba que el `HEAD` del checkout
    corresponde a ese commit. Si no, falla: el verificador juzga una cosa
    distinta de la que se publica.
-2. Lista los `.md` **agregados y modificados en ese commit**, con
-   `git diff-tree --no-commit-id --name-only -r --diff-filter=AM <sha>`.
+2. Lista los `.md` agregados y modificados entre la base de publicación y el
+   árbol final anunciado. Esto incluye documentos de cualquier commit del push.
 3. Corre el linter de documentación sobre esos archivos con la **misma regla
    de severidad que el `pre-commit`**: un documento **nuevo** tiene que pasar
    todas las reglas; un documento **previo modificado** solo bloquea por
    errores críticos (mojibake, posible secreto, links `file://`) y el resto se
    informa como aviso.
-4. Si el commit no agrega ni modifica ningún `.md`, sale con 0: un commit de
-   código no tiene por qué fallar.
+4. Si el diff no agrega ni modifica `.md`, sale con 0: un push de solo código
+   no tiene por qué fallar.
 
 Por qué no usa `origin/main`: en el checkout descartable el `origin` es el
 **worktree local**, no GitHub. Ahí `origin/main` no existe cuando el
@@ -130,8 +142,8 @@ repositorio de origen no tiene una rama local `main`, y cuando existe
 describe otra cosa: no el commit anunciado sino el estado de la rama. El
 linter en modo `--changed` (`git diff origin/main...HEAD`) falla en ese
 checkout o revisa el árbol equivocado. El helper saca el conjunto de archivos
-del **propio commit**, así que juzga exactamente lo que se publica, sin
-depender de ninguna referencia remota.
+del **diff entre la base observada y el árbol final**. No depende de referencias
+remotas locales del checkout temporal.
 
 Configuración:
 
