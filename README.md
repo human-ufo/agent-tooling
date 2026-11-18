@@ -338,3 +338,23 @@ no equivale a un fallo de publicación ni autoriza una limpieza automática.
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+## Métricas de verificación local
+
+Desde un checkout, `./bin/agent-ci-metrics --days 14` imprime un informe JSON
+de los JSONL existentes en `~/.cache/agent-changesets`. También acepta
+`--directory <ruta>` y respeta `AGENT_CHANGESET_DIR`. El comando solo lee
+archivos y puede ejecutarse directamente para revisar el piloto de dos semanas.
+
+El informe cuenta verificaciones por repositorio y resultado, omisiones por
+`optional-unconfigured`, y percentiles p50/p95 por rango más próximo de duración
+y espera. Los campos `run_samples` y `queue_samples` explicitan cuántas muestras
+tenían duración disponible. Los registros inválidos se contabilizan y los
+eventos idénticos duplicados se cuentan una vez. Una operación puede verificar
+varias referencias, por lo que estos contadores representan verificaciones.
+
+`repos_with_unconfigured_verifications` identifica repositorios con omisiones
+históricas dentro de la ventana. Para conocer su configuración actual hay que
+consultar Git. Los datos locales permiten comparar tiempos y omisiones del
+piloto. La cobertura de merges requiere consultar los SHA y checks de GitHub,
+y el costo monetario requiere una fuente de facturación.
