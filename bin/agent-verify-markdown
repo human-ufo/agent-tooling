@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Validate the complete announced tree of a reference or tool catalog repository.
+set -Eeuo pipefail
+source_path="$(readlink -f "${BASH_SOURCE[0]}")"
+exec python3 "$(dirname "$source_path")/../lib/agent_verify_markdown.py" "$@"
