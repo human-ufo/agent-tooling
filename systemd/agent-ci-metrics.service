@@ -1,0 +1,8 @@
+[Unit]
+Description=Report local publication verification metrics for the last 14 days
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/agent-ci-metrics --days 14
+StandardOutput=journal
+StandardError=journal

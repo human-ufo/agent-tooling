@@ -358,3 +358,39 @@ históricas dentro de la ventana. Para conocer su configuración actual hay que
 consultar Git. Los datos locales permiten comparar tiempos y omisiones del
 piloto. La cobertura de merges requiere consultar los SHA y checks de GitHub,
 y el costo monetario requiere una fuente de facturación.
+
+Para conservar un reporte semanal en el journal, instalar
+`systemd/agent-ci-metrics.service` y `.timer` en `~/.config/systemd/user/`,
+enlazar el comando desde un release validado en `~/.local/bin/` y ejecutar
+`systemctl --user enable --now agent-ci-metrics.timer` tras `daemon-reload`.
+El timer corre los lunes a las 09:15 (hora local), con recuperación de una
+ejecución perdida. Consultar `journalctl --user -u agent-ci-metrics.service`.
+Es un reporte histórico: no notifica por Telegram ni implementa alarmas de
+etapas Terraform/dbt. Los saltos previos permanecen en la ventana de 14 días.
+
+## Verificación estructural de repos documentales
+
+`agent-verify-markdown --profile reference <sha>` verifica el árbol completo
+de Markdown tracked: UTF-8, títulos, documentos vacíos, marcadores de conflicto
+y destinos locales de enlaces inline y definiciones por referencia. No exige
+el formato de documentos de sesión. El perfil `radar` agrega campos y estados
+de las fichas, categorías de `TAXONOMY.md` y correspondencia única entre fichas
+e `INDEX.md` (incluyendo estado y categoría). Un destino eliminado bloquea.
+
+El verificador exige checkout limpio y coincidencia con el commit anunciado,
+incluyendo tags resueltos a commit. Se configura mediante ruta absoluta a un
+release instalado, por ejemplo:
+
+```bash
+git -C /ruta/al/tool-radar config agent.pushVerify \
+  '/ruta/al/release/bin/agent-verify-markdown --profile radar'
+git -C /ruta/al/tool-radar config agent.pushVerifyMode required
+git -C /ruta/al/paca-crm-reverse-engineering config agent.pushVerify \
+  '/ruta/al/release/bin/agent-verify-markdown --profile reference'
+git -C /ruta/al/paca-crm-reverse-engineering config agent.pushVerifyMode required
+```
+
+El chequeo es offline: no comprueba disponibilidad de URLs externas ni
+existencia de anchors, sintaxis Markdown completa o exactitud del contenido.
+Los ejemplos en bloques de código no se interpretan como enlaces. No ejecuta
+código del repositorio ni cambia archivos.
