@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+source_path="$(readlink -f "${BASH_SOURCE[0]}")"
+exec python3 "$(dirname "$source_path")/../lib/agent_ci_ingestion.py" "$@"

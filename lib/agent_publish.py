@@ -361,6 +361,9 @@ def verify(worktree, update, trace, mode, command, repo_id=None, remote_url=None
                 env.update(AGENT_VERIFY_REF=update["ref"], AGENT_VERIFY_SHA=update["new"],
                            AGENT_VERIFY_OLD_SHA=old, AGENT_VERIFY_BASE_SHA=baseline,
                            AGENT_VERIFY_OBJECT_TYPE=kind or "unknown",
+                           AGENT_VERIFY_REPOSITORY_ID=repo_id,
+                           AGENT_VERIFY_SOURCE=str(worktree),
+                           AGENT_VERIFY_REMOTE_URL=remote_url or "",
                            GIT_TERMINAL_PROMPT="0")
                 timeout_text = config("agent.pushVerifyTimeout") or "300"
                 try:
@@ -639,12 +642,28 @@ def wrapper(args):
             if len(parts) >= 3 and len(parts[0]) == 1:
                 statuses.append(dict(flag=parts[0], refspec=parts[1], detail=parts[2]))
         consumed = not token_path.exists()
-        confirmed = len(statuses) == len(updates)
+        confirmed = _all_updates_reported(statuses, updates)
+        accepted = confirmed and p.returncode == 0 and _all_updates_accepted(statuses, updates)
         trace.emit("remote-result", result=("confirmed" if confirmed else "indeterminate"),
-                   outcome=("accepted" if p.returncode == 0 and confirmed else "rejected" if confirmed else "unknown"),
+                   outcome=("accepted" if accepted else "rejected" if confirmed else "unknown"),
                    returncode=p.returncode, statuses=statuses, authorization_consumed=consumed)
         if p.returncode == 0 and not consumed:
             raise Rejected("installed pre-push hook did not consume operation authorization")
+        if accepted and consumed:
+            try:
+                callback = config("agent.postPush")
+            except Rejected as e:
+                trace.emit("post-push", result="failure", reason=str(e))
+                print("agent-push: post-push callback failed after remote accepted the publication: " + str(e),
+                      file=sys.stderr)
+                return 1
+            if callback:
+                try:
+                    run_post_push(callback, worktree, repo_id, opt.remote, url, updates, trace)
+                except Rejected as e:
+                    print("agent-push: post-push callback failed after remote accepted the publication: " + str(e),
+                          file=sys.stderr)
+                    return 1
         return p.returncode
     except (Rejected, OSError) as e:
         trace.emit("reject", source="agent-push", reason=str(e))
@@ -659,6 +678,60 @@ def wrapper(args):
                     print("agent-push: publication lock retained: " + str(result), file=sys.stderr)
             except (Rejected, OSError) as e:
                 print("agent-push: publication lock release failed: " + str(e), file=sys.stderr)
+
+
+def _all_updates_reported(statuses, updates):
+    """Require one porcelain status for each requested destination."""
+    expected = {update["ref"] for update in updates}
+    seen = set()
+    for row in statuses:
+        refspec = row.get("refspec", "")
+        destination = refspec.rsplit(":", 1)[-1]
+        if destination not in expected or destination in seen:
+            return False
+        seen.add(destination)
+    return seen == expected
+
+
+def _all_updates_accepted(statuses, updates):
+    """Require a successful porcelain flag for every requested destination."""
+    successful = {" ", "=", "*", "+", "-"}
+    return _all_updates_reported(statuses, updates) and all(
+        row.get("flag") in successful for row in statuses)
+
+
+def run_post_push(command, worktree, repo_id, remote, url, updates, trace):
+    """Run configured post-push argv with a filtered environment and bounded lifetime."""
+    try:
+        argv = shlex.split(command)
+        if not argv:
+            raise Rejected("empty post-push command")
+        timeout_text = config("agent.postPushTimeout") or "900"
+        try:
+            timeout = int(timeout_text)
+            if timeout < 1 or timeout > 86400:
+                raise ValueError()
+        except ValueError as e:
+            raise Rejected("agent.postPushTimeout must be 1..86400 seconds") from e
+        allowed = {"PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "LANG", "SYSTEMROOT"}
+        env = {key: value for key, value in os.environ.items()
+               if key in allowed or key.startswith("LC_")}
+        env["AGENT_POST_PUSH_REPOSITORY_ID"] = repo_id
+        payload = json.dumps(dict(remote=remote, url=url, updates=updates))
+        p = subprocess.Popen(argv, cwd=worktree, env=env, stdin=subprocess.PIPE,
+                             start_new_session=True, text=True)
+        try:
+            p.communicate(payload, timeout=timeout)
+        except subprocess.TimeoutExpired as e:
+            os.killpg(p.pid, signal.SIGKILL)
+            p.wait()
+            raise Rejected("post-push callback timed out") from e
+        if p.returncode:
+            raise Rejected("post-push callback exited with status " + str(p.returncode))
+        trace.emit("post-push", result="success")
+    except (OSError, ValueError, Rejected) as e:
+        trace.emit("post-push", result="failure", reason=str(e))
+        raise Rejected(str(e)) from e
 
 
 def ensure_hook(worktree):

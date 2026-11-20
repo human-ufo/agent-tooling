@@ -394,3 +394,51 @@ El chequeo es offline: no comprueba disponibilidad de URLs externas ni
 existencia de anchors, sintaxis Markdown completa o exactitud del contenido.
 Los ejemplos en bloques de código no se interpretan como enlaces. No ejecuta
 código del repositorio ni cambia archivos.
+
+## CI de publicación y merge de ingestion
+
+El helper instalado `agent-verify-ingestion` ejecuta la cobertura `affected`
+del SHA anunciado, con `main` obtenido del endpoint de push. Requiere los
+scripts CI del repositorio y un hook actualizado que inyecte
+`AGENT_VERIFY_REPOSITORY_ID` y `AGENT_VERIFY_REMOTE_URL` tras filtrar el entorno.
+Las credenciales de proveedores no se heredan. Los fallos del scanner se
+conservan sin imprimir sus coincidencias. El timeout recomendado es 1.800 s,
+porque los cambios compartidos pueden ampliar la selección a cobertura completa.
+
+`agent.postPush` es opcional y contiene un argv sin shell. Solo se ejecuta
+cuando el remoto confirmó cada ref y el hook consumió la autorización.
+Recibe por stdin JSON con `remote`, `url` y `updates`; el cwd es el checkout
+fuente. `AGENT_POST_PUSH_REPOSITORY_ID` es metadata confiable inyectada por el
+wrapper. Su entorno conserva solo PATH, HOME, USER, LOGNAME, TMPDIR, LANG,
+LC_* y SYSTEMROOT. `agent.postPushTimeout` acepta 1–86.400 s (default 900).
+Un fallo devuelve error aunque el push ya esté aceptado; no se revierte ni
+se registra como rechazo remoto. No corre en resultados indeterminados ni
+en operaciones sin cambios.
+
+Configuración local para `avla-data-ingestion-platform`, desde su worktree:
+
+```bash
+git config agent.pushVerify /ruta/al/release/bin/agent-verify-ingestion
+git config agent.pushVerifyMode required
+git config agent.pushVerifyTimeout 1800
+git config agent.postPush '/ruta/al/release/bin/agent-ci-ingestion post-push'
+git config agent.postPushTimeout 900
+```
+
+El callback publica `local-ci/affected` reutilizando evidencia del commit y
+la base remota comprobados. Si falla el status, se puede revalidar sin un
+push adicional: `agent-ci-ingestion publish origin refs/heads/<rama> <sha>`.
+
+El wrapper de `gh` resuelve primero la identidad y luego delega `pr merge`
+a `agent-ci-ingestion merge`. Los tokens explícitos no omiten esta guarda.
+Para AVLA exige un PR abierto del mismo repo, dirigido a main, cuyo head
+contenga el main vigente. Ejecuta/reutiliza full del SHA exacto, reconsulta
+head y main, publica `local-ci/platform` y usa `--match-head-commit`.
+Rechaza `--auto`, `--admin` y la API directa de merge, incluida GraphQL.
+Los merges de otros repos mantienen su flujo previo.
+
+Son controles locales para clientes cooperativos. No impiden el uso directo
+de otros clientes o la web, ni cierran atómicamente la carrera final de la
+base remota: eso requiere protección del servidor. No se configura ningún
+servicio cloud. La caché compartida tiene identidad SHA-256 por repositorio,
+caducidad de 24 h y separación de scope, base, scripts y entorno.
